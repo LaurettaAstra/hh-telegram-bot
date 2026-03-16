@@ -50,7 +50,7 @@ def run_monitoring_check() -> list[MonitoringResult]:
     users = get_active_users()
     if not users:
         logger.info("Monitoring run: no active users")
-        return _run_default_monitoring()
+        return []
 
     results = []
     for user in users:
@@ -174,43 +174,3 @@ def process_filter_for_user(user, filter_obj) -> list[tuple[dict, int, int]]:
     return to_send
 
 
-def _run_default_monitoring() -> list[MonitoringResult]:
-    """Fallback: default search when no active users. Uses env TELEGRAM_USER_ID."""
-    import os
-    user_id_raw = os.getenv("TELEGRAM_USER_ID")
-    if not user_id_raw:
-        logger.warning("Monitoring: TELEGRAM_USER_ID not set, skipping default search")
-        return []
-
-    try:
-        api_vacancies = search_vacancies()
-    except Exception as e:
-        logger.exception("Monitoring run failed: HH API error: %s", e)
-        return []
-
-    if not api_vacancies:
-        return []
-
-    try:
-        new_vacancies = filter_new_vacancies(api_vacancies)
-    except Exception as e:
-        logger.exception("Monitoring run failed: DB filter error: %s", e)
-        return []
-
-    if not new_vacancies:
-        return []
-
-    try:
-        saved_ids = save_vacancies_to_db(new_vacancies)
-    except Exception as e:
-        logger.exception("Monitoring run failed: DB save error: %s", e)
-        return []
-
-    items = [(v, saved_ids[str(v["id"])], 0) for v in new_vacancies if str(v.get("id", "")) in saved_ids]
-    logger.info("Monitoring run (default): saved %d new vacancies", len(new_vacancies))
-    return [
-        MonitoringResult(
-            user_telegram_id=int(user_id_raw),
-            items_to_send=items,
-        )
-    ]
