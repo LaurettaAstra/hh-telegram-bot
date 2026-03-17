@@ -42,7 +42,8 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 def _ensure_user(update: Update):
     """
     Ensure user exists in DB. Creates a new user if they don't exist.
-    Returns (user, None) on success, (None, error_msg) on DB error.
+    Does not perform authorization — any Telegram user is allowed.
+    Returns (user, None) on success, (None, error_msg) on DB error only.
     """
     try:
         u = update.effective_user
