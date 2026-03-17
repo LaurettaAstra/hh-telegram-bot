@@ -23,18 +23,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-USER_ID_RAW = os.getenv("TELEGRAM_USER_ID")
 
 print("BOT_TOKEN loaded:", bool(BOT_TOKEN))
-print("TELEGRAM_USER_ID loaded:", USER_ID_RAW)
 
 if not BOT_TOKEN:
     raise ValueError("Не найден BOT_TOKEN в .env")
-
-if not USER_ID_RAW:
-    raise ValueError("Не найден TELEGRAM_USER_ID в .env")
-
-USER_ID = int(USER_ID_RAW)
 
 # Main reply keyboard with emoji buttons
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -48,10 +41,9 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 
 def _ensure_user(update: Update):
     """
-    Ensure user exists in DB. Returns (user, None) if allowed, (None, error_msg) if not.
+    Ensure user exists in DB. Creates a new user if they don't exist.
+    Returns (user, None) on success, (None, error_msg) on DB error.
     """
-    if update.effective_user.id != USER_ID:
-        return None, "Доступ запрещен"
     try:
         u = update.effective_user
         user = get_or_create_user(
