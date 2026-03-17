@@ -15,6 +15,7 @@ from app.user_repository import (
     get_user_filter_by_id,
     get_user_filters,
     update_filter_monitoring,
+    USER_FRIENDLY_ERROR,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,7 @@ async def filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, ensure
         filters_list = get_user_filters(user.id)
     except Exception as e:
         logger.exception("get_user_filters failed: %s", e)
-        await update.message.reply_text(f"Ошибка при загрузке фильтров: {e}")
+        await update.message.reply_text(USER_FRIENDLY_ERROR)
         return
 
     if not filters_list:
@@ -167,7 +168,7 @@ async def callback_filter_search(update: Update, context: ContextTypes.DEFAULT_T
         found, vacancies = search_vacancies_page(0, search_params, filter_obj=f)
     except Exception as e:
         logger.exception("Search failed: %s", e)
-        await query.edit_message_text(f"Ошибка при запросе к HH: {e}")
+        await query.edit_message_text(USER_FRIENDLY_ERROR)
         return
 
     if found == 0:
@@ -271,7 +272,7 @@ async def callback_filter_delete(update: Update, context: ContextTypes.DEFAULT_T
         logger.info("[FILTERS] Showing updated list with %d filters", len(filters_list))
     except Exception as e:
         logger.exception("[FILTERS] Delete failed: %s", e)
-        await query.edit_message_text(f"Ошибка: {e}")
+        await query.edit_message_text(USER_FRIENDLY_ERROR)
 
 
 def build_filters_handlers(ensure_user_fn):

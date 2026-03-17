@@ -1,0 +1,508 @@
+openapi: 3.0.3
+info:
+  title: HH Vacancy Bot - API Specification
+  description: |
+    This project is a **Telegram bot** for searching HH.ru vacancies. It does NOT expose a REST API.
+
+    ## Project Architecture
+    - **Telegram Bot**: Commands /start, /search, /filters, /info (via python-telegram-bot)
+    - **External API**: Consumes HH.ru API (https://api.hh.ru) for vacancy search
+    - **Database**: PostgreSQL with SQLAlchemy (User, SavedFilter, Vacancy models)
+
+    ## Documented Here
+    1. **External HH.ru API** - The API this project consumes for vacancy search
+    2. **Schemas** - Derived from SQLAlchemy models (for future REST API or reference)
+    3. **TODO** - Potential REST endpoints if a web layer is added
+  version: 1.0.0
+  contact:
+    name: HH Vacancy Bot
+
+servers:
+  - url: https://api.hh.ru
+    description: HH.ru public API (external, consumed by the bot)
+  # TODO: Add local/dev server when REST API is implemented
+  # - url: http://localhost:8000
+  #   description: Local development (future REST API)
+
+tags:
+  - name: Vacancies
+    description: HH.ru vacancy search (external API)
+  - name: Users
+    description: TODO - User management (future REST API)
+  - name: Filters
+    description: TODO - Saved search filters (future REST API)
+
+paths:
+  # =============================================================================
+  # External HH.ru API - consumed by app/hh_api.py
+  # =============================================================================
+  /vacancies:
+    get:
+      tags:
+        - Vacancies
+      summary: Search vacancies (HH.ru API)
+      description: |
+        External HH.ru API. Called by `app.hh_api.get_vacancies_page()` and `search_vacancies()`.
+        Used for interactive search and monitoring.
+      operationId: getVacancies
+      parameters:
+        - name: text
+          in: query
+          description: Search query. Project uses AND/NOT operators for keywords.
+          schema:
+            type: string
+            example: "системный аналитик AND бизнес аналитик NOT 1С"
+        - name: search_field
+          in: query
+          description: Fields to search. Project uses name, description.
+          schema:
+            type: array
+            items:
+              type: string
+              enum: [name, description, company_name]
+        - name: area
+          in: query
+          description: HH.ru area ID (e.g. 1 = Moscow)
+          schema:
+            type: integer
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [publication_time, salary_desc, salary_asc]
+            default: publication_time
+        - name: period
+          in: query
+          description: Vacancies published in last N days
+          schema:
+            type: integer
+            enum: [1, 3, 7, 30]
+        - name: experience
+          in: query
+          description: HH.ru experience code
+          schema:
+            type: string
+            enum: [noExperience, between1And3, between3And6, moreThan6]
+        - name: employment
+          in: query
+          description: HH.ru employment code
+          schema:
+            type: string
+            enum: [full, part, project, volunteer, probation]
+        - name: schedule
+          in: query
+          description: Work schedule. Project uses remote, flyInFlyOut, fullDay
+          schema:
+            type: string
+            enum: [remote, flyInFlyOut, fullDay]
+        - name: salary
+          in: query
+          description: Minimum salary filter
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Vacancy search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HHVacancySearchResponse"
+        "4xx":
+          description: HH.ru API error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # =============================================================================
+  # TODO - Future REST API endpoints (not implemented)
+  # =============================================================================
+  # /api/users:
+  #   get:
+  #     tags: [Users]
+  #     summary: TODO - List users
+  #   post:
+  #     tags: [Users]
+  #     summary: TODO - Create user
+  # /api/users/{telegram_id}:
+  #   get:
+  #     tags: [Users]
+  #     summary: TODO - Get user by telegram_id
+  # /api/filters:
+  #   get:
+  #     tags: [Filters]
+  #     summary: TODO - List filters (requires user auth)
+  #   post:
+  #     tags: [Filters]
+  #     summary: TODO - Create filter
+  # /api/filters/{id}:
+  #   get:
+  #     tags: [Filters]
+  #     summary: TODO - Get filter
+  #   delete:
+  #     tags: [Filters]
+  #     summary: TODO - Delete filter
+  # /api/vacancies/search:
+  #   post:
+  #     tags: [Vacancies]
+  #     summary: TODO - Search vacancies (proxy to HH API with project filters)
+
+components:
+  schemas:
+    # ---------------------------------------------------------------------------
+    # HH.ru API response schemas (external)
+    # ---------------------------------------------------------------------------
+    HHVacancySearchResponse:
+      type: object
+      properties:
+        found:
+          type: integer
+          description: Total number of vacancies found
+        pages:
+          type: integer
+        per_page:
+          type: integer
+        page:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/HHVacancyItem"
+
+    HHVacancyItem:
+      type: object
+      description: Raw HH.ru API vacancy item
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        alternate_url:
+          type: string
+        published_at:
+          type: string
+          format: date-time
+        salary:
+          $ref: "#/components/schemas/HHSalary"
+        employer:
+          type: object
+          properties:
+            name:
+              type: string
+        schedule:
+          type: object
+          properties:
+            name:
+              type: string
+        experience:
+          type: object
+          properties:
+            name:
+              type: string
+        employment:
+          type: object
+          properties:
+            name:
+              type: string
+        area:
+          type: object
+          properties:
+            name:
+              type: string
+        snippet:
+          type: object
+
+    HHSalary:
+      type: object
+      properties:
+        from:
+          type: integer
+        to:
+          type: integer
+        currency:
+          type: string
+
+    # ---------------------------------------------------------------------------
+    # Project internal schemas (from app/models.py - SQLAlchemy)
+    # ---------------------------------------------------------------------------
+    User:
+      type: object
+      description: User model from app.models.User
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        telegram_id:
+          type: integer
+          format: int64
+          description: Telegram user ID
+        username:
+          type: string
+          nullable: true
+        first_name:
+          type: string
+          nullable: true
+        last_name:
+          type: string
+          nullable: true
+        is_active:
+          type: boolean
+          default: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+
+    SavedFilter:
+      type: object
+      description: Saved search filter from app.models.SavedFilter
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        user_id:
+          type: integer
+          readOnly: true
+        name:
+          type: string
+        title_keywords:
+          type: string
+          nullable: true
+        title_exclude_keywords:
+          type: string
+          nullable: true
+        description_keywords:
+          type: string
+          nullable: true
+        description_exclude_keywords:
+          type: string
+          nullable: true
+        city:
+          type: string
+          nullable: true
+        work_format:
+          type: string
+          nullable: true
+          description: schedule - remote, fullDay, flyInFlyOut
+        experience:
+          type: string
+          nullable: true
+          description: noExperience, between1And3, etc.
+        employment:
+          type: string
+          nullable: true
+          description: full, part, project, etc.
+        salary_from:
+          type: integer
+          nullable: true
+        monitoring_enabled:
+          type: boolean
+          default: false
+        last_monitoring_at:
+          type: string
+          format: date-time
+          nullable: true
+        monitoring_started_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+
+    SavedFilterCreate:
+      type: object
+      description: Request body for creating a filter (from user_repository.save_user_filter)
+      required:
+        - name
+      properties:
+        name:
+          type: string
+        title_keywords:
+          type: string
+          nullable: true
+        title_exclude_keywords:
+          type: string
+          nullable: true
+        description_keywords:
+          type: string
+          nullable: true
+        description_exclude_keywords:
+          type: string
+          nullable: true
+        city:
+          type: string
+          nullable: true
+        work_format:
+          type: string
+          nullable: true
+        experience:
+          type: string
+          nullable: true
+        employment:
+          type: string
+          nullable: true
+        salary_from:
+          type: integer
+          nullable: true
+        monitoring_enabled:
+          type: boolean
+          default: false
+
+    Vacancy:
+      type: object
+      description: Vacancy model from app.models.Vacancy (stored in DB)
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        hh_id:
+          type: string
+          description: HH.ru vacancy ID
+        title:
+          type: string
+        company:
+          type: string
+          nullable: true
+        city:
+          type: string
+          nullable: true
+        salary_from:
+          type: integer
+          nullable: true
+        salary_to:
+          type: integer
+          nullable: true
+        currency:
+          type: string
+          nullable: true
+        url:
+          type: string
+          nullable: true
+        published_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+
+    VacancyDisplay:
+      type: object
+      description: Processed vacancy dict from hh_api._process_vacancy_items (sent to user)
+      properties:
+        id:
+          type: string
+          description: HH.ru vacancy ID
+        name:
+          type: string
+        company:
+          type: string
+        salary:
+          type: string
+          description: Formatted salary string
+        salary_from:
+          type: integer
+          nullable: true
+        salary_to:
+          type: integer
+          nullable: true
+        currency:
+          type: string
+          nullable: true
+        area:
+          type: string
+        schedule:
+          type: string
+        experience:
+          type: string
+        employment:
+          type: string
+        url:
+          type: string
+        published_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    SearchSession:
+      type: object
+      description: Search session from app.models.SearchSession
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        user_id:
+          type: integer
+        title_keywords:
+          type: string
+          nullable: true
+        title_exclude_keywords:
+          type: string
+          nullable: true
+        description_keywords:
+          type: string
+          nullable: true
+        city:
+          type: string
+          nullable: true
+        work_format:
+          type: string
+          nullable: true
+        salary_from:
+          type: integer
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    FilterVacancyMatch:
+      type: object
+      description: Tracks vacancy sent to user for filter (app.models.FilterVacancyMatch)
+      properties:
+        id:
+          type: integer
+        filter_id:
+          type: integer
+        vacancy_id:
+          type: integer
+        matched_at:
+          type: string
+          format: date-time
+        sent_to_user:
+          type: boolean
+
+    Error:
+      type: object
+      properties:
+        description:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+              value:
+                type: string

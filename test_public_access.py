@@ -19,6 +19,17 @@ os.environ.setdefault("BOT_TOKEN", "123456:TEST-TOKEN-for-unit-tests")
 TEST_TELEGRAM_ID = 999888777666
 
 ACCESS_DENIED = "Доступ запрещен"
+USER_FRIENDLY_ERROR = "Не удалось обработать запрос. Попробуйте ещё раз позже."
+
+# Raw error patterns that must NOT be shown to users
+RAW_ERROR_PATTERNS = [
+    "Ошибка БД",
+    "IntegrityError",
+    "OperationalError",
+    "Connection",
+    "traceback",
+    "Exception:",
+]
 
 
 def make_mock_update(telegram_id: int, username: str = "test_new_user", first_name: str = "Test", last_name: str = "User"):
@@ -88,8 +99,19 @@ def test_handlers_receive_user():
     print("  [OK] Multiple new users can pass _ensure_user")
 
 
+def _assert_no_raw_error(text: str, context: str = ""):
+    """Assert reply does not contain raw DB/technical errors."""
+    if not text:
+        return
+    text_lower = text.lower()
+    for pattern in RAW_ERROR_PATTERNS:
+        assert pattern.lower() not in text_lower, (
+            f"{context}: must not show raw error '{pattern}', got: {text!r}"
+        )
+
+
 async def test_start_handler():
-    """Test /start handler does NOT reply with 'Доступ запрещен'."""
+    """Test /start handler: no access denial, no raw DB error, works for new user."""
     from main import start
 
     async def noop_set_commands(commands):
@@ -100,14 +122,18 @@ async def test_start_handler():
         bot=SimpleNamespace(set_my_commands=noop_set_commands),
     )
     await start(update, context)
+    assert len(replies) >= 1, "Handler should have replied"
     for text in replies:
         assert ACCESS_DENIED not in text, f"/start must not return access denied, got: {text!r}"
-    assert len(replies) >= 1, "Handler should have replied"
-    print("  [OK] /start handler responds correctly (no access denied)")
+        _assert_no_raw_error(text, "/start")
+    assert USER_FRIENDLY_ERROR not in replies[0], (
+        "/start should succeed for new user, not show error message"
+    )
+    print("  [OK] /start handler responds correctly (no access denied, no raw error)")
 
 
 async def test_info_handler():
-    """Test /info handler does NOT reply with 'Доступ запрещен'."""
+    """Test /info handler: no access denial, no raw DB error."""
     from main import info
 
     update, replies = make_mock_message_update(TEST_TELEGRAM_ID)
@@ -115,12 +141,13 @@ async def test_info_handler():
     await info(update, context)
     for text in replies:
         assert ACCESS_DENIED not in text, f"/info must not return access denied, got: {text!r}"
+        _assert_no_raw_error(text, "/info")
     assert len(replies) >= 1
-    print("  [OK] /info handler responds correctly (no access denied)")
+    print("  [OK] /info handler responds correctly (no access denied, no raw error)")
 
 
 async def test_filters_handler():
-    """Test /filters handler does NOT reply with 'Доступ запрещен'."""
+    """Test /filters handler: no access denial, no raw DB error, new user accepted."""
     from main import _ensure_user
     from app.filters_handlers import filters_cmd
 
@@ -129,8 +156,13 @@ async def test_filters_handler():
     await filters_cmd(update, context, _ensure_user)
     for text in replies:
         assert ACCESS_DENIED not in text, f"/filters must not return access denied, got: {text!r}"
+        _assert_no_raw_error(text, "/filters")
     assert len(replies) >= 1
-    print("  [OK] /filters handler responds correctly (no access denied)")
+    # New user with no filters gets empty state message, not generic error
+    assert USER_FRIENDLY_ERROR not in replies[0], (
+        "/filters should work for new user, not show generic error"
+    )
+    print("  [OK] /filters handler responds correctly (no access denied, no raw error)")
 
 
 def cleanup_test_user():

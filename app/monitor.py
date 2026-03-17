@@ -15,11 +15,10 @@ from typing import NamedTuple
 
 from app.hh_api import _search_params_from_filter, search_vacancies
 from app.repository import (
+    already_sent,
     filter_new_vacancies,
-    get_vacancy_by_hh_id,
-    mark_vacancy_sent_to_filter,
+    mark_vacancy_sent,
     save_vacancies_to_db,
-    was_vacancy_sent_to_filter,
 )
 from app.user_repository import get_active_users, get_user_monitoring_filters, update_filter_last_monitoring
 
@@ -30,7 +29,8 @@ class MonitoringResult(NamedTuple):
     """Result of monitoring for one user."""
 
     user_telegram_id: int
-    items_to_send: list[tuple[dict, int, int]]  # (vacancy_dict, vacancy_id, filter_id)
+    user_id: int  # internal user id for VacancySentLog
+    items_to_send: list[tuple[dict, int]]  # (vacancy_dict, filter_id)
 
 
 def run_monitoring_check() -> list[MonitoringResult]:
@@ -77,6 +77,7 @@ def run_monitoring_check() -> list[MonitoringResult]:
                 results.append(
                     MonitoringResult(
                         user_telegram_id=user.telegram_id,
+                        user_id=user.id,
                         items_to_send=user_items,
                     )
                 )
@@ -86,13 +87,12 @@ def run_monitoring_check() -> list[MonitoringResult]:
     return results
 
 
-def process_filter_for_user(user, filter_obj) -> list[tuple[dict, int, int]]:
+def process_filter_for_user(user, filter_obj) -> list[tuple[dict, int]]:
     """
-    Fetch vacancies for filter, ensure in DB, return list of (vacancy_dict, vacancy_id, filter_id)
-    that have not yet been sent to this user for this filter.
+    Fetch vacancies for filter, return list of (vacancy_dict, filter_id) that have not
+    yet been sent to this user for this filter. Deduplication by HH vacancy_id (string).
 
-    First-run baseline: if last_monitoring_at is NULL, fetch vacancies, mark all as sent
-    (baseline) without sending, update last_monitoring_at, return [].
+    First-run baseline: if last_monitoring_at is NULL, mark all as sent without sending.
 
     Does NOT send or mark as sent - caller does that after successful send.
     """
@@ -107,21 +107,14 @@ def process_filter_for_user(user, filter_obj) -> list[tuple[dict, int, int]]:
     if getattr(filter_obj, "last_monitoring_at", None) is None:
         try:
             new_vacancies = filter_new_vacancies(api_vacancies)
-            saved_ids = {}
             if new_vacancies:
-                saved_ids = save_vacancies_to_db(new_vacancies)
+                save_vacancies_to_db(new_vacancies)
             for v in api_vacancies:
                 hh_id = str(v.get("id", ""))
                 if not hh_id:
                     continue
-                vacancy_id = saved_ids.get(hh_id)
-                if vacancy_id is None:
-                    vac = get_vacancy_by_hh_id(hh_id)
-                    if not vac:
-                        continue
-                    vacancy_id = vac.id
-                if not was_vacancy_sent_to_filter(filter_obj.id, vacancy_id):
-                    mark_vacancy_sent_to_filter(filter_obj.id, vacancy_id)
+                if not already_sent(hh_id, user.id, filter_obj.id):
+                    mark_vacancy_sent(hh_id, user.id, filter_obj.id)
             update_filter_last_monitoring(filter_obj.id, datetime.now(timezone.utc))
             logger.info(
                 "Filter '%s' (id=%s): first-run baseline, %d vacancies marked, no send",
@@ -133,34 +126,24 @@ def process_filter_for_user(user, filter_obj) -> list[tuple[dict, int, int]]:
             logger.exception("First-run baseline failed for filter %s: %s", filter_obj.id, e)
         return []
 
-    # Save new vacancies to DB
+    # Save new vacancies to DB (for search/filters; dedup uses hh_id)
     new_vacancies = filter_new_vacancies(api_vacancies)
-    saved_ids = {}
     if new_vacancies:
         try:
-            saved_ids = save_vacancies_to_db(new_vacancies)
+            save_vacancies_to_db(new_vacancies)
         except Exception as e:
             logger.exception("Failed to save vacancies for filter %s: %s", filter_obj.id, e)
             return []
 
-    # Build hh_id -> vacancy_id for all api_vacancies
+    # Deduplicate by HH vacancy_id: only send if not already_sent
     to_send = []
     for v in api_vacancies:
         hh_id = str(v.get("id", ""))
         if not hh_id:
             continue
-
-        vacancy_id = saved_ids.get(hh_id)
-        if vacancy_id is None:
-            vac = get_vacancy_by_hh_id(hh_id)
-            if not vac:
-                continue
-            vacancy_id = vac.id
-
-        if was_vacancy_sent_to_filter(filter_obj.id, vacancy_id):
+        if already_sent(hh_id, user.id, filter_obj.id):
             continue
-
-        to_send.append((v, vacancy_id, filter_obj.id))
+        to_send.append((v, filter_obj.id))
 
     update_filter_last_monitoring(filter_obj.id, datetime.now(timezone.utc))
     if to_send:

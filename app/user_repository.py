@@ -2,12 +2,18 @@
 Repository layer for users and saved filters.
 """
 
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.db import SessionLocal
 from app.models import SavedFilter, User
+
+logger = logging.getLogger(__name__)
+
+USER_FRIENDLY_ERROR = "Не удалось обработать запрос. Попробуйте ещё раз позже."
 
 
 def get_or_create_user(
@@ -18,6 +24,10 @@ def get_or_create_user(
 ) -> User:
     """
     Get existing user by telegram_id or create a new one.
+
+    Handles race condition: if two concurrent requests try to create the same
+    new user, one may get IntegrityError (unique violation). We retry with SELECT
+    to fetch the user created by the other request.
 
     Returns:
         User instance (existing or newly created).
@@ -48,6 +58,19 @@ def get_or_create_user(
         session.commit()
         session.refresh(user)
         return user
+    except IntegrityError as e:
+        session.rollback()
+        # Race condition: another request created the user. Fetch it.
+        logger.info("get_or_create_user race condition for telegram_id=%s, retrying SELECT: %s", telegram_id, e)
+        session2 = SessionLocal()
+        try:
+            result = session2.execute(select(User).where(User.telegram_id == telegram_id))
+            user = result.scalars().first()
+            if user:
+                return user
+        finally:
+            session2.close()
+        raise
     except Exception:
         session.rollback()
         raise

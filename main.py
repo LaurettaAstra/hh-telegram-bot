@@ -9,10 +9,10 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Messa
 from app.config import MONITOR_INTERVAL_MINUTES
 from app.monitor import run_monitoring_check
 from app.notifier import send_vacancies_to_telegram
-from app.repository import mark_vacancy_sent_to_filter
+from app.repository import mark_vacancy_sent
 from app.search_flow import build_search_conversation_handler
 from app.filters_handlers import build_filters_handlers
-from app.user_repository import get_or_create_user
+from app.user_repository import get_or_create_user, USER_FRIENDLY_ERROR
 
 load_dotenv()
 
@@ -56,7 +56,7 @@ def _ensure_user(update: Update):
         return user, None
     except Exception as e:
         logger.exception("get_or_create_user failed: %s", e)
-        return None, f"Ошибка БД: {e}"
+        return None, USER_FRIENDLY_ERROR
 
 
 async def _refresh_bot_commands(bot):
@@ -115,17 +115,18 @@ async def monitoring_job_callback(context: ContextTypes.DEFAULT_TYPE):
         for result in results:
             if not result.items_to_send:
                 continue
-            for vacancy_dict, vacancy_id, filter_id in result.items_to_send:
+            for vacancy_dict, filter_id in result.items_to_send:
+                hh_id = str(vacancy_dict.get("id", ""))
                 try:
                     await send_vacancies_to_telegram(
                         context.bot, result.user_telegram_id, [vacancy_dict]
                     )
-                    if filter_id:
-                        mark_vacancy_sent_to_filter(filter_id, vacancy_id)
+                    if hh_id and filter_id:
+                        mark_vacancy_sent(hh_id, result.user_id, filter_id)
                 except Exception as e:
                     logger.exception(
                         "Failed to send vacancy %s to user %s: %s",
-                        vacancy_id,
+                        hh_id,
                         result.user_telegram_id,
                         e,
                     )

@@ -12,7 +12,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
 from app.hh_api import _build_search_text, search_vacancies_page
-from app.user_repository import save_user_filter
+from app.user_repository import save_user_filter, USER_FRIENDLY_ERROR
 from app.vacancy_results import _store_search_state, fetch_and_show_page
 
 logger = logging.getLogger(__name__)
@@ -369,7 +369,7 @@ async def receive_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE)
             prefix = "Фильтр сохранён в Сохраненные фильтры.\n\n"
         except Exception as e:
             logger.exception("Failed to save filter: %s", e)
-            prefix = f"Ошибка при сохранении: {e}\n\n"
+            prefix = f"{USER_FRIENDLY_ERROR}\n\n"
 
     keyboard = _build_inline_keyboard(RUN_SEARCH_BUTTON, "run")
     await query.edit_message_text(
@@ -395,7 +395,7 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         found, vacancies = search_vacancies_page(0, search_params, filter_obj)
     except Exception as e:
         logger.exception("Search failed: %s", e)
-        await query.edit_message_text(f"Ошибка при запросе к HH: {e}")
+        await query.edit_message_text(USER_FRIENDLY_ERROR)
         _clear_search_data(context)
         return ConversationHandler.END
 

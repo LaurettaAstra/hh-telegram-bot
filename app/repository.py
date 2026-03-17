@@ -2,12 +2,13 @@
 Repository layer for saving vacancies to the database.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.db import SessionLocal
-from app.models import FilterVacancyMatch, Vacancy
+from app.models import FilterVacancyMatch, Vacancy, VacancySentLog
 
 
 def filter_new_vacancies(vacancies: list) -> list:
@@ -152,6 +153,60 @@ def mark_vacancy_sent_to_filter(filter_id: int, vacancy_id: int) -> None:
         )
         session.add(match)
         session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+# --- VacancySentLog: deduplication by HH vacancy_id (string) ---
+
+
+def already_sent(vacancy_id: str, user_id: int, filter_id: int) -> bool:
+    """
+    Check if vacancy (HH id string) was already sent to this user for this filter.
+    Deduplication is based ONLY on vacancy_id - ignores published_at or HH updates.
+    """
+    if not vacancy_id or not str(vacancy_id).strip():
+        return True
+    session = SessionLocal()
+    try:
+        result = session.execute(
+            select(VacancySentLog).where(
+                VacancySentLog.user_id == user_id,
+                VacancySentLog.filter_id == filter_id,
+                VacancySentLog.vacancy_id == str(vacancy_id),
+            )
+        )
+        return result.scalars().first() is not None
+    finally:
+        session.close()
+
+
+def mark_vacancy_sent(vacancy_id: str, user_id: int, filter_id: int) -> None:
+    """
+    Record that vacancy (HH id string) was sent to user for this filter.
+    Idempotent: handles race condition via try/except on unique violation.
+    """
+    if not vacancy_id or not str(vacancy_id).strip():
+        return
+    session = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        log = VacancySentLog(
+            user_id=user_id,
+            filter_id=filter_id,
+            vacancy_id=str(vacancy_id),
+            first_seen_at=now,
+            sent_at=now,
+        )
+        session.add(log)
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        # Race: another process already inserted (unique violation) - treat as success
+        pass
     except Exception:
         session.rollback()
         raise
