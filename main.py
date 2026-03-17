@@ -76,13 +76,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _refresh_bot_commands(context.bot)
     await update.message.reply_text(
-        "Бот работает.\n\n"
-        "Текущий фильтр по умолчанию:\n"
-        "• только Системный / Бизнес аналитик\n"
-        "• удаленка\n"
-        "• без слов: 1С, Битрикс, DWH, Lead, Senior\n"
-        "• выборка: 300 последних вакансий\n\n"
-        "Используйте кнопки меню ниже:",
+        "Добро пожаловать! Для навигации по чат-боту воспользуйтесь меню ниже:",
         reply_markup=MAIN_KEYBOARD,
     )
 
