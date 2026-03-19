@@ -9,9 +9,13 @@ mark them as baseline (sent) without sending, then set last_monitoring_at.
 This prevents spamming users with historical backlog.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from telegram import Bot
 
 from app.hh_api import _search_params_from_filter, search_vacancies
 from app.repository import (
@@ -29,7 +33,7 @@ class MonitoringResult(NamedTuple):
     """Result of monitoring for one user."""
 
     user_telegram_id: int
-    user_id: int  # internal user id for VacancySentLog
+    user_id: int  # internal user id for filter_vacancy_matches
     items_to_send: list[tuple[dict, int]]  # (vacancy_dict, filter_id)
 
 
@@ -49,8 +53,10 @@ def run_monitoring_check() -> list[MonitoringResult]:
     """
     users = get_active_users()
     if not users:
-        logger.info("Monitoring run: no active users")
+        logger.debug("Monitoring run: no active users")
         return []
+
+    logger.info("Monitoring run: checking %d active user(s) for new vacancies", len(users))
 
     results = []
     for user in users:
@@ -157,3 +163,66 @@ def process_filter_for_user(user, filter_obj) -> list[tuple[dict, int]]:
     return to_send
 
 
+async def monitoring_loop(
+    bot: "Bot",
+    interval_minutes: int,
+    send_fn,
+    mark_sent_fn,
+) -> None:
+    """
+    Continuous background loop: periodically runs monitoring check, sends
+    notifications, updates last_monitoring_at. Runs in parallel with bot polling.
+
+    Args:
+        bot: Telegram Bot instance for sending messages
+        interval_minutes: Minutes between monitoring runs
+        send_fn: Async callable(bot, chat_id, vacancies) to send notifications
+        mark_sent_fn: Sync callable(hh_id, user_id, filter_id) to mark vacancy sent
+    """
+    interval_seconds = interval_minutes * 60
+    first_run_delay = min(60, interval_seconds)  # First run after 1 min or interval
+    logger.info(
+        "Monitoring loop started: first run in %ds, then every %d minutes",
+        first_run_delay,
+        interval_minutes,
+    )
+
+    while True:
+        try:
+            await asyncio.sleep(first_run_delay)
+            first_run_delay = interval_seconds  # Subsequent runs use full interval
+            logger.info("MONITOR WORKING")
+            logger.info("Monitoring loop: starting check run")
+            results = await asyncio.to_thread(run_monitoring_check)
+
+            total_sent = 0
+            for result in results:
+                if not result.items_to_send:
+                    continue
+                for vacancy_dict, filter_id in result.items_to_send:
+                    hh_id = str(vacancy_dict.get("id", ""))
+                    try:
+                        await send_fn(bot, result.user_telegram_id, [vacancy_dict])
+                        if hh_id and filter_id:
+                            await asyncio.to_thread(
+                                mark_sent_fn, hh_id, result.user_id, filter_id
+                            )
+                        total_sent += 1
+                    except Exception as e:
+                        logger.exception(
+                            "Failed to send vacancy %s to user %s: %s",
+                            hh_id,
+                            result.user_telegram_id,
+                            e,
+                        )
+
+            if total_sent > 0:
+                logger.info("Monitoring loop: sent %d vacancy notifications", total_sent)
+            else:
+                logger.debug("Monitoring loop: check complete, no new vacancies to send")
+
+        except asyncio.CancelledError:
+            logger.info("Monitoring loop cancelled (bot shutting down)")
+            raise
+        except Exception as e:
+            logger.exception("Monitoring loop error (will retry): %s", e)

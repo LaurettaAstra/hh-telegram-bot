@@ -5,10 +5,9 @@ Repository layer for saving vacancies to the database.
 from datetime import datetime, timezone
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 
 from app.db import SessionLocal
-from app.models import FilterVacancyMatch, Vacancy, VacancySentLog
+from app.models import FilterVacancyMatch, Vacancy
 
 
 def filter_new_vacancies(vacancies: list) -> list:
@@ -141,18 +140,33 @@ def was_vacancy_sent_to_filter(filter_id: int, vacancy_id: int) -> bool:
 
 
 def mark_vacancy_sent_to_filter(filter_id: int, vacancy_id: int) -> None:
-    """Record that vacancy was sent to user for this filter. Idempotent."""
+    """
+    Record that vacancy was sent to user for this filter. Idempotent.
+    Uses filter_vacancy_matches: upserts (update if exists, else insert).
+    """
     if was_vacancy_sent_to_filter(filter_id, vacancy_id):
         return
     session = SessionLocal()
     try:
-        match = FilterVacancyMatch(
-            filter_id=filter_id,
-            vacancy_id=vacancy_id,
-            sent_to_user=True,
+        result = session.execute(
+            select(FilterVacancyMatch).where(
+                FilterVacancyMatch.filter_id == filter_id,
+                FilterVacancyMatch.vacancy_id == vacancy_id,
+            )
         )
-        session.add(match)
-        session.commit()
+        match = result.scalars().first()
+        if match:
+            match.sent_to_user = True
+            session.commit()
+        else:
+            session.add(
+                FilterVacancyMatch(
+                    filter_id=filter_id,
+                    vacancy_id=vacancy_id,
+                    sent_to_user=True,
+                )
+            )
+            session.commit()
     except Exception:
         session.rollback()
         raise
@@ -160,55 +174,30 @@ def mark_vacancy_sent_to_filter(filter_id: int, vacancy_id: int) -> None:
         session.close()
 
 
-# --- VacancySentLog: deduplication by HH vacancy_id (string) ---
+# --- Deduplication via filter_vacancy_matches (hh_id -> vacancy.id) ---
 
 
 def already_sent(vacancy_id: str, user_id: int, filter_id: int) -> bool:
     """
     Check if vacancy (HH id string) was already sent to this user for this filter.
-    Deduplication is based ONLY on vacancy_id - ignores published_at or HH updates.
+    Uses filter_vacancy_matches: resolves hh_id -> vacancies.id, checks sent_to_user.
     """
     if not vacancy_id or not str(vacancy_id).strip():
         return True
-    session = SessionLocal()
-    try:
-        result = session.execute(
-            select(VacancySentLog).where(
-                VacancySentLog.user_id == user_id,
-                VacancySentLog.filter_id == filter_id,
-                VacancySentLog.vacancy_id == str(vacancy_id),
-            )
-        )
-        return result.scalars().first() is not None
-    finally:
-        session.close()
+    vacancy = get_vacancy_by_hh_id(str(vacancy_id))
+    if not vacancy:
+        return False
+    return was_vacancy_sent_to_filter(filter_id, vacancy.id)
 
 
 def mark_vacancy_sent(vacancy_id: str, user_id: int, filter_id: int) -> None:
     """
     Record that vacancy (HH id string) was sent to user for this filter.
-    Idempotent: handles race condition via try/except on unique violation.
+    Uses filter_vacancy_matches: resolves hh_id -> vacancies.id, upserts sent_to_user.
     """
     if not vacancy_id or not str(vacancy_id).strip():
         return
-    session = SessionLocal()
-    try:
-        now = datetime.now(timezone.utc)
-        log = VacancySentLog(
-            user_id=user_id,
-            filter_id=filter_id,
-            vacancy_id=str(vacancy_id),
-            first_seen_at=now,
-            sent_at=now,
-        )
-        session.add(log)
-        session.commit()
-    except IntegrityError:
-        session.rollback()
-        # Race: another process already inserted (unique violation) - treat as success
-        pass
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+    vacancy = get_vacancy_by_hh_id(str(vacancy_id))
+    if not vacancy:
+        return
+    mark_vacancy_sent_to_filter(filter_id, vacancy.id)

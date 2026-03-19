@@ -9,9 +9,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
-    String,
     Text,
-    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -102,6 +100,10 @@ class Vacancy(Base):
 
 
 class FilterVacancyMatch(Base):
+    """
+    Tracks vacancy matches per filter. sent_to_user=True when notification was sent.
+    Used for deduplication: (filter_id, vacancy_id) + sent_to_user.
+    """
     __tablename__ = "filter_vacancy_matches"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -112,19 +114,3 @@ class FilterVacancyMatch(Base):
 
     filter = relationship("SavedFilter", back_populates="filter_vacancy_matches")
     vacancy = relationship("Vacancy", back_populates="filter_vacancy_matches")
-
-
-class VacancySentLog(Base):
-    """
-    Deduplication: track vacancies sent per user per filter by HH vacancy_id (string).
-    Ensures each vacancy is sent only once, even if HH re-indexes or updates it.
-    """
-    __tablename__ = "vacancy_sent_log"
-    __table_args__ = (UniqueConstraint("user_id", "filter_id", "vacancy_id", name="uq_vacancy_sent_user_filter"),)
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    filter_id = Column(Integer, ForeignKey("saved_filters.id"), nullable=False)
-    vacancy_id = Column(Text, nullable=False)  # HH API vacancy id (string)
-    first_seen_at = Column(DateTime(timezone=True), server_default=func.now())
-    sent_at = Column(DateTime(timezone=True), server_default=func.now())

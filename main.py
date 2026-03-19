@@ -7,7 +7,7 @@ from telegram import BotCommand, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app.config import MONITOR_INTERVAL_MINUTES
-from app.monitor import run_monitoring_check
+from app.monitor import monitoring_loop, run_monitoring_check
 from app.notifier import send_vacancies_to_telegram
 from app.repository import mark_vacancy_sent
 from app.search_flow import build_search_conversation_handler
@@ -101,9 +101,8 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def monitoring_job_callback(context: ContextTypes.DEFAULT_TYPE):
-    """Scheduled job: per-user monitoring, send only unsent vacancies, track delivery.
-    Mark as sent only after successful Telegram delivery (idempotent).
-    """
+    """Job_queue callback: per-user monitoring, send only unsent vacancies, track delivery."""
+    logger.info("MONITOR WORKING")
     try:
         results = run_monitoring_check()
         for result in results:
@@ -119,13 +118,13 @@ async def monitoring_job_callback(context: ContextTypes.DEFAULT_TYPE):
                         mark_vacancy_sent(hh_id, result.user_id, filter_id)
                 except Exception as e:
                     logger.exception(
-                        "Failed to send vacancy %s to user %s: %s",
+                        "MONITOR FAILED: send vacancy %s to user %s: %s",
                         hh_id,
                         result.user_telegram_id,
                         e,
                     )
-    except Exception as e:
-        logger.exception("Monitoring job failed: %s", e)
+    except Exception:
+        logger.exception("MONITOR FAILED")
 
 
 def main():
@@ -136,8 +135,47 @@ def main():
 
     async def post_init(application):
         await _refresh_bot_commands(application.bot)
+        # Fallback: if job_queue is None, use asyncio monitoring loop
+        if not application.job_queue:
+            task = asyncio.create_task(
+                monitoring_loop(
+                    bot=application.bot,
+                    interval_minutes=MONITOR_INTERVAL_MINUTES,
+                    send_fn=send_vacancies_to_telegram,
+                    mark_sent_fn=mark_vacancy_sent,
+                )
+            )
+            def _on_monitoring_done(t):
+                try:
+                    t.result()
+                except asyncio.CancelledError:
+                    logger.info("Monitoring loop cancelled (bot shutting down)")
+                except Exception:
+                    logger.exception("Monitoring loop stopped with error")
+
+            task.add_done_callback(_on_monitoring_done)
+            logger.info(
+                "Monitoring loop: job_queue not available, using asyncio fallback every %d min",
+                MONITOR_INTERVAL_MINUTES,
+            )
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # Schedule vacancy monitoring via job_queue (every N minutes)
+    if app.job_queue:
+        interval_seconds = MONITOR_INTERVAL_MINUTES * 60
+        app.job_queue.run_repeating(
+            monitoring_job_callback,
+            interval=interval_seconds,
+            first=1,
+            name="hh_monitor",
+        )
+        logger.info(
+            "Scheduled monitoring (job_queue): every %d minutes",
+            MONITOR_INTERVAL_MINUTES,
+        )
+    else:
+        logger.warning("Job queue not available; monitoring uses asyncio fallback in post_init")
 
     # Filters handlers in group -1 so they run BEFORE ConversationHandlers
     for handler in build_filters_handlers(_ensure_user):
@@ -154,21 +192,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("info", info))
 
-    # Start scheduled monitoring (every N minutes)
-    if app.job_queue:
-        interval_seconds = MONITOR_INTERVAL_MINUTES * 60
-        app.job_queue.run_repeating(
-            monitoring_job_callback,
-            interval=interval_seconds,
-            first=interval_seconds,
-            name="hh_monitor",
-        )
-        logger.info(
-            "Scheduled monitoring started: every %d minutes",
-            MONITOR_INTERVAL_MINUTES,
-        )
-    else:
-        logger.warning("Job queue not available; scheduled monitoring disabled")
+    # Monitoring: job_queue.run_repeating (or asyncio fallback if job_queue is None)
 
     print("Бот запущен")
     app.run_polling()
