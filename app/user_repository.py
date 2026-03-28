@@ -5,7 +5,7 @@ Repository layer for users and saved filters.
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.db import SessionLocal
@@ -254,13 +254,28 @@ def delete_user_filter(filter_id: int, user_id: int) -> bool:
             )
         )
         f = result.scalars().first()
+
         if not f:
             return False
+
+        # delete dependent records first (FK constraint)
+        logger.info(f"Deleting vacancy_sent_log records for filter_id={filter_id}")
+        session.execute(
+            text("DELETE FROM vacancy_sent_log WHERE filter_id = :filter_id"),
+            {"filter_id": filter_id},
+        )
+        session.flush()
+
+        # delete filter
+        logger.info(f"Deleting filter id={filter_id}")
         session.delete(f)
         session.commit()
+
         return True
+
     except Exception:
         session.rollback()
         raise
+
     finally:
         session.close()
