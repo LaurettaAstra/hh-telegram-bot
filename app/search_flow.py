@@ -17,6 +17,24 @@ from app.vacancy_results import _store_search_state, fetch_and_show_page
 
 logger = logging.getLogger(__name__)
 
+# Name for ConversationHandler so we can end this conversation when switching flows.
+SEARCH_CONVERSATION_NAME = "search_flow"
+
+
+async def reset_search_conversation(application, update: Update) -> None:
+    """End search wizard state so other menus do not see stale wizard steps (PTB ConversationHandler)."""
+    for handlers in application.handlers.values():
+        for h in handlers:
+            if isinstance(h, ConversationHandler) and getattr(h, "name", None) == SEARCH_CONVERSATION_NAME:
+                key = h._get_key(update)
+                async with h._timeout_jobs_lock:
+                    job = h.timeout_jobs.pop(key, None)
+                    if job is not None:
+                        job.schedule_removal()
+                h._update_state(ConversationHandler.END, key)
+                return
+
+
 # Conversation states
 (
     TITLE_KEYWORDS,
@@ -435,6 +453,7 @@ def build_search_conversation_handler(ensure_user_fn):
     """Build ConversationHandler for /search - interactive filter setup then one-time search."""
 
     async def wrapped_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await reset_search_conversation(context.application, update)
         user, err = ensure_user_fn(update)
         if err:
             await update.message.reply_text(err)
@@ -443,6 +462,7 @@ def build_search_conversation_handler(ensure_user_fn):
         return await search_entry(update, context)
 
     return ConversationHandler(
+        name=SEARCH_CONVERSATION_NAME,
         entry_points=[
             CommandHandler("search", wrapped_entry),
             CommandHandler("jobs", wrapped_entry),

@@ -9,6 +9,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app.hh_api import _search_params_from_filter, search_vacancies_page
+from app.search_flow import reset_search_conversation
 from app.vacancy_results import _store_search_state, fetch_and_show_page, handle_vacancy_page_callback
 from app.user_repository import (
     delete_user_filter,
@@ -77,6 +78,7 @@ def _build_filter_detail_keyboard(filter_id: int, monitoring_enabled: bool) -> I
 
 async def filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, ensure_user_fn):
     """Show Мои сохраненные фильтры - ONLY inline keyboard with filter buttons."""
+    await reset_search_conversation(context.application, update)
     logger.info("[FILTERS] Opening saved filters list")
     user, err = ensure_user_fn(update)
     if err:
@@ -106,6 +108,7 @@ async def filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, ensure
 
 async def callback_filter_select(update: Update, context: ContextTypes.DEFAULT_TYPE, ensure_user_fn):
     """User tapped filter button - show filter detail with Начать поиск and Удалить фильтр."""
+    await reset_search_conversation(context.application, update)
     query = update.callback_query
     logger.info("[FILTERS] Opening filter detail, callback_data=%s", query.data)
     await query.answer()
@@ -137,6 +140,7 @@ async def callback_filter_select(update: Update, context: ContextTypes.DEFAULT_T
 
 async def callback_filter_search(update: Update, context: ContextTypes.DEFAULT_TYPE, ensure_user_fn):
     """User tapped Начать поиск - run vacancy search with this filter."""
+    await reset_search_conversation(context.application, update)
     query = update.callback_query
     await query.answer()
 
@@ -192,6 +196,7 @@ async def callback_filter_search(update: Update, context: ContextTypes.DEFAULT_T
 
 async def callback_filter_monitor_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, ensure_user_fn, enable: bool):
     """User tapped Включить/Отключить мониторинг."""
+    await reset_search_conversation(context.application, update)
     query = update.callback_query
     await query.answer()
 
@@ -232,6 +237,7 @@ async def callback_filter_monitor_toggle(update: Update, context: ContextTypes.D
 
 async def callback_filter_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, ensure_user_fn):
     """User tapped Удалить фильтр - delete from DB, show confirmation, return to list."""
+    await reset_search_conversation(context.application, update)
     query = update.callback_query
     logger.info("[FILTERS] Delete button pressed, callback_data=%s", query.data)
     await query.answer()

@@ -17,7 +17,7 @@ from app.config import MONITOR_INTERVAL_MINUTES
 from app.monitor import monitoring_loop, run_monitoring_check
 from app.notifier import send_vacancies_to_telegram
 from app.repository import mark_vacancy_sent
-from app.search_flow import build_search_conversation_handler
+from app.search_flow import build_search_conversation_handler, reset_search_conversation
 from app.filters_handlers import build_filters_handlers
 from app.user_repository import get_or_create_user, USER_FRIENDLY_ERROR
 
@@ -76,6 +76,7 @@ async def _refresh_bot_commands(bot):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await reset_search_conversation(context.application, update)
     user, err = _ensure_user(update)
     if err:
         await update.message.reply_text(err)
@@ -89,6 +90,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await reset_search_conversation(context.application, update)
     user, err = _ensure_user(update)
     if err:
         await update.message.reply_text(err)
