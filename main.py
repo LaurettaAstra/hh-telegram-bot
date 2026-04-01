@@ -42,6 +42,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton("ℹ️ О боте")],
     ],
     resize_keyboard=True,
+    is_persistent=True,
 )
 
 
@@ -66,10 +67,12 @@ def _ensure_user(update: Update):
 
 
 async def _refresh_bot_commands(bot):
-    """Set bot commands with emoji."""
+    """Register slash commands aligned with the reply keyboard; clear stale menu first."""
+    await bot.delete_my_commands()
     await bot.set_my_commands(
         [
-            BotCommand("start", "Запуск бота"),
+            BotCommand("search", "🔍 Поиск вакансий"),
+            BotCommand("filters", "💾 Мои фильтры"),
             BotCommand("info", "ℹ️ О боте"),
         ]
     )
