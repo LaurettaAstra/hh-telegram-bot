@@ -399,7 +399,12 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         _clear_search_data(context)
         return ConversationHandler.END
 
-    if found == 0:
+    logger.info(
+        "[SEARCH_FLOW] run_search first page: found=%s len_vacancies=%s",
+        found,
+        len(vacancies),
+    )
+    if not vacancies:
         await query.edit_message_text("По вашему запросу вакансии не найдены.")
         _clear_search_data(context)
         return ConversationHandler.END

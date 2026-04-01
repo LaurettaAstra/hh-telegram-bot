@@ -2,7 +2,10 @@
 Telegram notification helpers for sending vacancy messages.
 """
 
+import logging
 import math
+
+logger = logging.getLogger(__name__)
 
 MAX_VACANCIES_PER_BATCH = 15
 
@@ -72,6 +75,24 @@ async def send_vacancies_to_telegram(bot, chat_id: int, vacancies: list) -> None
         chat_id: Target chat ID
         vacancies: List of vacancy dicts
     """
-    for vacancy in vacancies[:MAX_VACANCIES_PER_BATCH]:
+    batch = vacancies[:MAX_VACANCIES_PER_BATCH]
+    logger.info(
+        "send_vacancies_to_telegram: chat_id=%s sending %d message(s) (batch max=%s)",
+        chat_id,
+        len(batch),
+        MAX_VACANCIES_PER_BATCH,
+    )
+    for vacancy in batch:
         text = format_vacancy_message(vacancy)
+        hh_id = str(vacancy.get("id", ""))
+        logger.info(
+            "send_vacancies_to_telegram: calling bot.send_message chat_id=%s hh_vacancy_id=%s",
+            chat_id,
+            hh_id,
+        )
         await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        logger.info(
+            "send_vacancies_to_telegram: bot.send_message completed chat_id=%s hh_vacancy_id=%s",
+            chat_id,
+            hh_id,
+        )

@@ -1,5 +1,11 @@
 import json
+import logging
 import requests
+
+logger = logging.getLogger(__name__)
+
+# Preview length for logged response.text in get_vacancies_page
+_HH_LOG_TEXT_PREVIEW = 1000
 
 
 INCLUDE_TITLE_WORDS = [
@@ -114,6 +120,12 @@ def _build_search_text(
 
 
 def get_vacancies_page(page: int, search_params: dict | None = None, per_page: int = 100):
+    """
+    GET https://api.hh.ru/vacancies — official HH API (public vacancy search).
+
+    Params match the public API (text, search_field, area, period, salary, etc.).
+    See: https://api.hh.ru/openapi/redoc#tag/Poisk-vakansij/operation/get-vacancies
+    """
     url = "https://api.hh.ru/vacancies"
 
     params = {
@@ -143,10 +155,41 @@ def get_vacancies_page(page: int, search_params: dict | None = None, per_page: i
     if "text" not in params:
         params["text"] = "аналитик"
 
+    prepared = requests.Request("GET", url, params=params).prepare()
+    logger.info("[HH_API] get_vacancies_page request URL=%s", prepared.url)
+
     response = requests.get(url, params=params, timeout=20)
+
+    preview = response.text[:_HH_LOG_TEXT_PREVIEW]
+    logger.info(
+        "[HH_API] get_vacancies_page response status_code=%s text_preview_first_%s_chars=%r",
+        response.status_code,
+        _HH_LOG_TEXT_PREVIEW,
+        preview,
+    )
+
     response.raise_for_status()
 
-    return response.json()
+    try:
+        data = response.json()
+    except json.JSONDecodeError as e:
+        logger.exception("[HH_API] get_vacancies_page JSON decode failed: %s", e)
+        raise
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"HH API JSON must be an object (dict), got {type(data).__name__!r}"
+        )
+
+    items = data.get("items")
+    logger.info(
+        "[HH_API] get_vacancies_page parsed keys=%s items_len=%s found=%s",
+        list(data.keys()),
+        len(items) if isinstance(items, list) else type(items).__name__,
+        data.get("found"),
+    )
+
+    return data
 
 
 def _search_params_from_filter(f) -> dict:
@@ -210,28 +253,124 @@ def search_vacancies_page(page: int, search_params: dict | None = None, filter_o
     Fetch one page of vacancies from HH API (10 per page for pagination).
 
     Returns:
-        (found, vacancies) - found is total from HH API, vacancies is list of vacancy dicts.
+        (found, vacancies) - found is total from HH API (best effort), vacancies is list of vacancy dicts.
     """
-    data = get_vacancies_page(page, search_params, per_page=10)
-    found = data.get("found", 0)
-    vacancies = _process_vacancy_items(data.get("items", []), filter_obj)
+    per_page = 10
+    data = get_vacancies_page(page, search_params, per_page=per_page)
+
+    raw_items = data.get("items", [])
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    n_raw = len(raw_items)
+    api_found = data.get("found") or 0
+    try:
+        api_found = int(api_found)
+    except (TypeError, ValueError):
+        api_found = 0
+
+    # HH may omit or zero "found" while still returning items; do not treat as empty.
+    if api_found == 0 and n_raw > 0:
+        logger.warning(
+            "[HH_API] search_vacancies_page: api_found=0 but len(raw_items)=%s — using found=%s for UI",
+            n_raw,
+            n_raw,
+        )
+        found = n_raw
+    else:
+        found = api_found
+
+    vacancies = _process_vacancy_items(raw_items, filter_obj)
+
+    logger.info(
+        "[HH_API] search_vacancies_page page=%s len(raw_items)=%s api_found=%s effective_found=%s len(vacancies)=%s",
+        page,
+        n_raw,
+        api_found,
+        found,
+        len(vacancies),
+    )
+    if n_raw > 0 and len(vacancies) == 0:
+        logger.warning(
+            "[HH_API] search_vacancies_page: all %s HH items dropped by _process_vacancy_items "
+            "(check _FILTER_* flags and title/remote logic)",
+            n_raw,
+        )
+
     return found, vacancies
 
 
+# Re-enable one at a time; when True, skipped items are logged at INFO.
+_FILTER_TITLE_ENABLED = False
+_FILTER_DESCRIPTION_ENABLED = False
+_FILTER_SCHEDULE_REMOTE_ENABLED = False
+
+
 def _process_vacancy_items(items: list, filter_obj) -> list:
-    """Process raw HH API items into vacancy dicts, applying filter_obj if provided."""
-    vacancies = []
+    """
+    Map HH API items to internal vacancy dicts (id, name, url, …).
+
+    When all _FILTER_* flags are False, no rows are dropped (title/description/remote
+    checks skipped); every item is converted. Set flags to True one-by-one to
+    re-enable filters (skips are logged at INFO).
+    """
+    if not isinstance(items, list):
+        logger.warning(
+            "[HH_API] _process_vacancy_items expected list, got %s — returning empty",
+            type(items).__name__,
+        )
+        return []
+
     use_custom_filter = filter_obj is not None
+    n_in = len(items)
+    skipped_title = 0
+    skipped_desc = 0
+    skipped_title_allowed = 0
+    skipped_schedule = 0
+    skipped_remote = 0
+
+    logger.info(
+        "[HH_API] _process_vacancy_items start n_items=%s use_custom_filter=%s "
+        "filter_flags title=%s description=%s schedule_remote=%s",
+        n_in,
+        use_custom_filter,
+        _FILTER_TITLE_ENABLED,
+        _FILTER_DESCRIPTION_ENABLED,
+        _FILTER_SCHEDULE_REMOTE_ENABLED,
+    )
+
+    vacancies = []
 
     for item in items:
         name = item.get("name", "")
-        if use_custom_filter:
-            if not _title_matches_filter(name, filter_obj):
+
+        if _FILTER_TITLE_ENABLED:
+            if use_custom_filter:
+                if not _title_matches_filter(name, filter_obj):
+                    skipped_title += 1
+                    logger.info(
+                        "[HH_API] _process_vacancy_items SKIP title_exclude id=%s name=%r",
+                        item.get("id"),
+                        name[:80] if name else "",
+                    )
+                    continue
+            elif not is_title_allowed(name):
+                skipped_title_allowed += 1
+                logger.info(
+                    "[HH_API] _process_vacancy_items SKIP title_allowed id=%s name=%r",
+                    item.get("id"),
+                    name[:80] if name else "",
+                )
                 continue
+
+        if _FILTER_DESCRIPTION_ENABLED and use_custom_filter:
             if not _description_matches_filter(item, filter_obj):
+                skipped_desc += 1
+                logger.info(
+                    "[HH_API] _process_vacancy_items SKIP description_exclude id=%s",
+                    item.get("id"),
+                )
                 continue
-        elif not is_title_allowed(name):
-            continue
 
         employer = item.get("employer") or {}
         schedule = item.get("schedule") or {}
@@ -243,11 +382,24 @@ def _process_vacancy_items(items: list, filter_obj) -> list:
         experience_name = experience.get("name", "")
         employment_name = employment.get("name", "")
 
-        if use_custom_filter:
-            if not _schedule_matches_filter(schedule_name, filter_obj):
+        if _FILTER_SCHEDULE_REMOTE_ENABLED:
+            if use_custom_filter:
+                if not _schedule_matches_filter(schedule_name, filter_obj):
+                    skipped_schedule += 1
+                    logger.info(
+                        "[HH_API] _process_vacancy_items SKIP schedule/work_format id=%s schedule=%r",
+                        item.get("id"),
+                        schedule_name,
+                    )
+                    continue
+            elif not is_remote(schedule_name):
+                skipped_remote += 1
+                logger.info(
+                    "[HH_API] _process_vacancy_items SKIP non_remote id=%s schedule=%r",
+                    item.get("id"),
+                    schedule_name,
+                )
                 continue
-        elif not is_remote(schedule_name):
-            continue
 
         salary_from = salary.get("from") if salary else None
         salary_to = salary.get("to") if salary else None
@@ -271,6 +423,19 @@ def _process_vacancy_items(items: list, filter_obj) -> list:
         }
         vacancies.append(vacancy)
 
+    n_out = len(vacancies)
+    logger.info(
+        "[HH_API] _process_vacancy_items done raw_items=%s out=%s "
+        "skipped_title_exclude=%s skipped_desc_exclude=%s skipped_title_allowed=%s "
+        "skipped_schedule=%s skipped_remote=%s",
+        n_in,
+        n_out,
+        skipped_title,
+        skipped_desc,
+        skipped_title_allowed,
+        skipped_schedule,
+        skipped_remote,
+    )
     return vacancies
 
 
@@ -281,10 +446,42 @@ def search_vacancies(search_params: dict | None = None, filter_obj=None):
     """
     vacancies = []
     use_custom_filter = filter_obj is not None
+    logger.info(
+        "[HH_API] search_vacancies start pages=0..2 per_page=100 use_custom_filter=%s search_params=%s",
+        use_custom_filter,
+        search_params,
+    )
 
     for page in range(3):
+        logger.info("[HH_API] search_vacancies step=fetch_page page=%s", page)
         data = get_vacancies_page(page, search_params, per_page=100)
 
-        vacancies.extend(_process_vacancy_items(data.get("items", []), filter_obj))
+        if not isinstance(data, dict):
+            logger.warning("[HH_API] search_vacancies page=%s: unexpected data type %s", page, type(data))
+            continue
 
+        raw_items = data.get("items")
+        if raw_items is None:
+            logger.warning("[HH_API] search_vacancies page=%s: no 'items' key, keys=%s", page, list(data.keys()))
+            raw_items = []
+        elif not isinstance(raw_items, list):
+            logger.warning(
+                "[HH_API] search_vacancies page=%s: 'items' is not a list, type=%s",
+                page,
+                type(raw_items).__name__,
+            )
+            raw_items = []
+
+        n_before = len(raw_items)
+        processed = _process_vacancy_items(raw_items, filter_obj)
+        n_after = len(processed)
+        logger.info(
+            "[HH_API] search_vacancies page=%s len_items_before_process=%s len_after_process=%s",
+            page,
+            n_before,
+            n_after,
+        )
+        vacancies.extend(processed)
+
+    logger.info("[HH_API] search_vacancies done total_vacancies=%s", len(vacancies))
     return vacancies

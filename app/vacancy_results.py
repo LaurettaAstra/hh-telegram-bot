@@ -71,7 +71,17 @@ async def fetch_and_show_page(
         logger.exception("search_vacancies_page failed: %s", e)
         return False
 
-    if found == 0:
+    logger.info(
+        "[VACANCY_UI] fetch_and_show_page page=%s found=%s len_vacancies=%s",
+        page,
+        found,
+        len(vacancies),
+    )
+    if not vacancies:
+        logger.info(
+            "[VACANCY_UI] fetch_and_show_page: empty vacancies list — nothing to send (found=%s)",
+            found,
+        )
         return False
 
     header_text = format_vacancies_page_header(found, period, page)

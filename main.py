@@ -1,10 +1,17 @@
-import asyncio
 import logging
 import os
 
 from dotenv import load_dotenv
 from telegram import BotCommand, KeyboardButton, ReplyKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import TimedOut, NetworkError
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from app.config import MONITOR_INTERVAL_MINUTES
 from app.monitor import monitoring_loop, run_monitoring_check
@@ -29,7 +36,6 @@ print("BOT_TOKEN loaded:", bool(BOT_TOKEN))
 if not BOT_TOKEN:
     raise ValueError("Не найден BOT_TOKEN в .env")
 
-# Main reply keyboard with emoji buttons
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🔍 Поиск вакансий"), KeyboardButton("💾 Мои фильтры")],
@@ -60,12 +66,13 @@ def _ensure_user(update: Update):
 
 
 async def _refresh_bot_commands(bot):
-    """Set bot commands with emoji (called on init and /start for cache refresh)."""
-    await bot.set_my_commands([
-        BotCommand("search", "🔍 Поиск вакансий"),
-        BotCommand("filters", "💾 Мои фильтры"),
-        BotCommand("info", "ℹ️ О боте"),
-    ])
+    """Set bot commands with emoji."""
+    await bot.set_my_commands(
+        [
+            BotCommand("start", "Запуск бота"),
+            BotCommand("info", "ℹ️ О боте"),
+        ]
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -82,7 +89,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /info - show help/about message."""
     user, err = _ensure_user(update)
     if err:
         await update.message.reply_text(err)
@@ -91,7 +97,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я бот для поиска вакансий на HH.ru\n\n"
         "Моя ключевая фишка: я умею присылать уведомления о только что опубликованных "
-        "вакансиях по твоим сохранённым фильтрам!\n\n"
+        "вакансиях по твоим сохранённым фильтрам.\n\n"
         "Для этого:\n"
         "1. Нужно зайти в меню «Поиск вакансий»\n"
         "2. Настроить фильтры поиска и сохранить фильтр\n"
@@ -101,18 +107,52 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def monitoring_job_callback(context: ContextTypes.DEFAULT_TYPE):
-    """Job_queue callback: per-user monitoring, send only unsent vacancies, track delivery."""
+    """job_queue callback: per-user monitoring, send only unsent vacancies, track delivery."""
     logger.info("MONITOR WORKING")
     try:
         results = run_monitoring_check()
+        n_results = len(results)
+        n_items = sum(len(r.items_to_send) for r in results)
+        logger.info(
+            "MONITOR job: run_monitoring_check returned %d user result(s), %d total vacancy item(s) to send",
+            n_results,
+            n_items,
+        )
         for result in results:
             if not result.items_to_send:
+                logger.info(
+                    "[MONITOR_TRACE] continue monitoring_job_callback reason=empty_items_to_send "
+                    "user_id=%s telegram_id=%s",
+                    result.user_id,
+                    result.user_telegram_id,
+                )
                 continue
+
+            logger.info(
+                "About to send %d vacancies to user telegram_id=%s (internal_user_id=%s)",
+                len(result.items_to_send),
+                result.user_telegram_id,
+                result.user_id,
+            )
             for vacancy_dict, filter_id in result.items_to_send:
                 hh_id = str(vacancy_dict.get("id", ""))
                 try:
+                    logger.info(
+                        "MONITOR send attempt: telegram_id=%s filter_id=%s hh_vacancy_id=%s",
+                        result.user_telegram_id,
+                        filter_id,
+                        hh_id,
+                    )
                     await send_vacancies_to_telegram(
-                        context.bot, result.user_telegram_id, [vacancy_dict]
+                        context.bot,
+                        result.user_telegram_id,
+                        [vacancy_dict],
+                    )
+                    logger.info(
+                        "MONITOR send ok: telegram_id=%s filter_id=%s hh_vacancy_id=%s",
+                        result.user_telegram_id,
+                        filter_id,
+                        hh_id,
                     )
                     if hh_id and filter_id:
                         mark_vacancy_sent(hh_id, result.user_id, filter_id)
@@ -123,45 +163,49 @@ async def monitoring_job_callback(context: ContextTypes.DEFAULT_TYPE):
                         result.user_telegram_id,
                         e,
                     )
-    except Exception:
-        logger.exception("MONITOR FAILED")
+    except Exception as e:
+        logger.exception("MONITOR FAILED: %s", e)
 
 
-def main():
-    print("Запускаем бота...")
+async def post_init(application: Application):
+    await _refresh_bot_commands(application.bot)
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    async def post_init(application):
-        await _refresh_bot_commands(application.bot)
-        # Fallback: if job_queue is None, use asyncio monitoring loop
-        if not application.job_queue:
-            task = asyncio.create_task(
-                monitoring_loop(
-                    bot=application.bot,
-                    interval_minutes=MONITOR_INTERVAL_MINUTES,
-                    send_fn=send_vacancies_to_telegram,
-                    mark_sent_fn=mark_vacancy_sent,
-                )
+    if not application.job_queue:
+        task = application.create_task(
+            monitoring_loop(
+                bot=application.bot,
+                interval_minutes=MONITOR_INTERVAL_MINUTES,
+                send_fn=send_vacancies_to_telegram,
+                mark_sent_fn=mark_vacancy_sent,
             )
-            def _on_monitoring_done(t):
-                try:
-                    t.result()
-                except asyncio.CancelledError:
-                    logger.info("Monitoring loop cancelled (bot shutting down)")
-                except Exception:
-                    logger.exception("Monitoring loop stopped with error")
+        )
 
-            task.add_done_callback(_on_monitoring_done)
-            logger.info(
-                "Monitoring loop: job_queue not available, using asyncio fallback every %d min",
-                MONITOR_INTERVAL_MINUTES,
-            )
+        def _on_monitoring_done(t):
+            try:
+                t.result()
+            except Exception:
+                logger.exception("Monitoring loop stopped with error")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+        task.add_done_callback(_on_monitoring_done)
 
-    # Schedule vacancy monitoring via job_queue (every N minutes)
+        logger.info(
+            "Monitoring loop: job_queue not available, using asyncio fallback every %d min",
+            MONITOR_INTERVAL_MINUTES,
+        )
+
+
+def build_application() -> Application:
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
+
     if app.job_queue:
         interval_seconds = MONITOR_INTERVAL_MINUTES * 60
         app.job_queue.run_repeating(
@@ -175,27 +219,49 @@ def main():
             MONITOR_INTERVAL_MINUTES,
         )
     else:
-        logger.warning("Job queue not available; monitoring uses asyncio fallback in post_init")
+        logger.warning(
+            "Job queue not available; monitoring uses asyncio fallback in post_init"
+        )
 
-    # Filters handlers in group -1 so they run BEFORE ConversationHandlers
     for handler in build_filters_handlers(_ensure_user):
         app.add_handler(handler, group=-1)
 
-    # Reply keyboard button handler for "ℹ️ О боте" (group -1)
     app.add_handler(
         MessageHandler(filters.Regex("^ℹ️ О боте$"), info),
         group=-1,
     )
 
     app.add_handler(build_search_conversation_handler(_ensure_user))
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("info", info))
 
-    # Monitoring: job_queue.run_repeating (or asyncio fallback if job_queue is None)
+    return app
+
+
+def main():
+    print("Запускаем бота...")
+
+    app = build_application()
 
     print("Бот запущен")
-    app.run_polling()
+
+    try:
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            poll_interval=2.0,
+            timeout=30,
+            bootstrap_retries=5,
+        )
+    except TimedOut:
+        logger.exception("Telegram polling timed out")
+        raise
+    except NetworkError:
+        logger.exception("Telegram network error")
+        raise
+    except Exception:
+        logger.exception("Bot crashed")
+        raise
 
 
 if __name__ == "__main__":

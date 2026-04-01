@@ -171,7 +171,12 @@ async def callback_filter_search(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(USER_FRIENDLY_ERROR)
         return
 
-    if found == 0:
+    logger.info(
+        "[FILTERS] callback_filter_search: found=%s len_vacancies=%s",
+        found,
+        len(vacancies),
+    )
+    if not vacancies:
         await query.edit_message_text("По вашему запросу вакансии не найдены.")
         return
 
