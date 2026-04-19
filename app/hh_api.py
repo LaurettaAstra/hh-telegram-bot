@@ -1,11 +1,271 @@
 import json
 import logging
+import time
+from urllib.parse import urlencode
+
 import requests
+
+from app.config import HH_API_HH_USER_AGENT
 
 logger = logging.getLogger(__name__)
 
-# Preview length for logged response.text in get_vacancies_page
-_HH_LOG_TEXT_PREVIEW = 1000
+# Do not log these request header names (secrets / credentials).
+_HH_HEADER_LOG_DENYLIST = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "x-api-key",
+    "api-key",
+})
+
+# Max chars of response body to log on errors (and preview on success).
+_HH_LOG_BODY_MAX = 1000
+
+# Delay before one retry on 403, 5xx, or timeout (seconds).
+_HH_RETRY_DELAY_SEC = 2.5
+
+HH_API_VACANCIES_URL = "https://api.hh.ru/vacancies"
+
+# Lazily populated on first call to _hh_request_get — single shared client for all api.hh.ru GETs.
+_HH_HTTP_CLIENT: requests.Session | None = None
+
+
+def _hh_full_url(base_url: str, params: dict) -> str:
+    """Full URL string for logging (matches requests encoding, including list params)."""
+    if not params:
+        return base_url
+    return f"{base_url}?{urlencode(params, doseq=True)}"
+
+
+def _hh_http_session() -> requests.Session:
+    """Create (once) and return the shared Session; default headers only on the client."""
+    global _HH_HTTP_CLIENT
+    if _HH_HTTP_CLIENT is None:
+        client = requests.Session()
+        client.headers.pop("User-Agent", None)
+        client.headers.update(
+            {
+                "HH-User-Agent": HH_API_HH_USER_AGENT,
+                "Accept": "application/json",
+            }
+        )
+        _HH_HTTP_CLIENT = client
+    return _HH_HTTP_CLIENT
+
+
+def _hh_drop_duplicate_user_agent(prepared: requests.PreparedRequest) -> None:
+    """HH API: use HH-User-Agent only; drop library User-Agent if both would be sent."""
+    h = prepared.headers
+    if h.get("HH-User-Agent"):
+        h.pop("User-Agent", None)
+
+
+def _hh_headers_for_log(headers) -> dict[str, str]:
+    """Copy headers to a dict safe for logs (redact secrets)."""
+    safe: dict[str, str] = {}
+    for key, value in headers.items():
+        lk = key.lower()
+        if lk in _HH_HEADER_LOG_DENYLIST:
+            safe[key] = "<redacted>"
+        else:
+            safe[key] = value
+    return safe
+
+
+def _log_hh_outgoing_headers(prepared: requests.PreparedRequest) -> None:
+    """Log final merged headers for this GET (no secrets)."""
+    safe = _hh_headers_for_log(prepared.headers)
+    ua = prepared.headers.get("User-Agent")
+    hh_ua = prepared.headers.get("HH-User-Agent")
+    logger.info(
+        "[HH_API] outgoing GET headers (final): %s | HH-User-Agent=%r User-Agent=%r",
+        safe,
+        hh_ua,
+        ua,
+    )
+
+
+def _log_hh_round_trip_diagnostics(
+    response: requests.Response,
+    full_url: str,
+    params: dict,
+    attempt: int,
+) -> None:
+    """
+    Temporary: full snapshot after each HH response (compare 403 vs 200, filter vs minimal).
+    """
+    req_headers = _hh_headers_for_log(response.request.headers)
+    body = response.text[:_HH_LOG_BODY_MAX]
+    effective_url = getattr(response, "url", None) or full_url
+    logger.info(
+        "[HH_API_DIAG] attempt=%s full_url=%s effective_url=%s params=%s status=%s "
+        "outgoing_headers=%s body_trunc_%s_chars=%r",
+        attempt,
+        full_url,
+        effective_url,
+        params,
+        response.status_code,
+        req_headers,
+        _HH_LOG_BODY_MAX,
+        body,
+    )
+
+
+def _hh_send_get(session: requests.Session, url: str, params: dict, timeout: float) -> requests.Response:
+    req = requests.Request("GET", url, params=params)
+    prepared = session.prepare_request(req)
+    _hh_drop_duplicate_user_agent(prepared)
+    _log_hh_outgoing_headers(prepared)
+    return session.send(prepared, timeout=timeout)
+
+
+def _log_hh_probe_summary(
+    log_tag: str,
+    response: requests.Response,
+    full_url: str,
+    params: dict,
+) -> None:
+    """Final probe snapshot: status, body, outgoing headers, effective URL (any HTTP status)."""
+    body = response.text[:_HH_LOG_BODY_MAX]
+    effective_url = getattr(response, "url", None) or full_url
+    outgoing = _hh_headers_for_log(response.request.headers)
+    logger.warning(
+        "%s status=%s effective_url=%s full_url=%s params=%s "
+        "outgoing_headers=%s body_trunc_%s_chars=%r",
+        log_tag,
+        response.status_code,
+        effective_url,
+        full_url,
+        params,
+        outgoing,
+        _HH_LOG_BODY_MAX,
+        body,
+    )
+
+
+class HHApiError(Exception):
+    """HH API HTTP layer failure (after retries). Not used for empty search results."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        url: str | None = None,
+        response_body_preview: str | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.url = url
+        self.response_body_preview = response_body_preview
+
+
+def _hh_request_get(
+    url: str,
+    params: dict | None = None,
+    *,
+    timeout: float = 20,
+) -> requests.Response:
+    """
+    Sole entry point for GET requests to api.hh.ru.
+    Uses one shared requests.Session created on first call; headers are set on the Session only.
+    One retry on 403, 5xx, or timeout. Raises HHApiError on failure after retries.
+    Returns response only for HTTP 200.
+    """
+    params = dict(params) if params else {}
+    full_url = _hh_full_url(url, params)
+
+    for attempt in range(2):
+        try:
+            response = _hh_send_get(_hh_http_session(), url, params, timeout)
+            _log_hh_round_trip_diagnostics(response, full_url, params, attempt + 1)
+        except requests.Timeout as e:
+            logger.error(
+                "[HH_API] request timeout attempt=%s/2 url=%s error=%s "
+                "(outgoing headers were logged immediately before send)",
+                attempt + 1,
+                full_url,
+                e,
+            )
+            if attempt == 0:
+                time.sleep(_HH_RETRY_DELAY_SEC)
+                continue
+            raise HHApiError(
+                f"HH API request timed out: {e}",
+                url=full_url,
+            ) from e
+
+        status = response.status_code
+        body_preview = response.text[:_HH_LOG_BODY_MAX]
+
+        if status == 200:
+            logger.info("[HH_API] GET ok status=%s url=%s (details in HH_API_DIAG)", status, full_url)
+            return response
+
+        logger.error(
+            "[HH_API] HH API error status=%s url=%s (details in HH_API_DIAG)",
+            status,
+            full_url,
+        )
+
+        if attempt == 0 and (status == 403 or status >= 500):
+            time.sleep(_HH_RETRY_DELAY_SEC)
+            continue
+
+        raise HHApiError(
+            f"HH API returned HTTP {status}: {body_preview}",
+            status_code=status,
+            url=full_url,
+            response_body_preview=body_preview,
+        )
+
+    raise HHApiError("HH API request failed after retries", url=full_url)
+
+
+def hh_api_minimal_probe(*, timeout: float = 20) -> int:
+    """
+    Temporary diagnostics: one minimal GET /vacancies using the same Session + HH-User-Agent
+    as production. Uses ``_hh_send_get`` + ``_hh_http_session()`` — the same HTTP primitive
+    inside ``_hh_request_get`` (single attempt so 403/200 both produce a Response to log).
+
+    Params: text=аналитик, per_page=1, page=0 only.
+
+    After the response, logs ``[HH_API_PROBE]`` with status, body, outgoing headers, effective URL.
+
+    Returns:
+        0 if HTTP 200, 1 otherwise.
+    """
+    params = {"text": "аналитик", "per_page": 1, "page": 0}
+    full_url = _hh_full_url(HH_API_VACANCIES_URL, params)
+    logger.warning(
+        "[HH_API_PROBE] minimal GET %s (single _hh_send_get; same session as _hh_request_get)",
+        full_url,
+    )
+    response = _hh_send_get(_hh_http_session(), HH_API_VACANCIES_URL, params, timeout)
+    _log_hh_probe_summary("[HH_API_PROBE]", response, full_url, params)
+    return 0 if response.status_code == 200 else 1
+
+
+def hh_api_no_text_probe(*, timeout: float = 20) -> int:
+    """
+    Temporary diagnostics: GET /vacancies with only per_page=1, page=0 (no ``text`` param).
+
+    Same Session + HH-User-Agent as production via ``_hh_send_get`` / ``_hh_http_session``.
+
+    Logs with tag ``[HH_API_PROBE_NO_TEXT]``.
+
+    Returns:
+        0 if HTTP 200, 1 otherwise.
+    """
+    params = {"per_page": 1, "page": 0}
+    full_url = _hh_full_url(HH_API_VACANCIES_URL, params)
+    logger.warning(
+        "[HH_API_PROBE_NO_TEXT] GET %s (single _hh_send_get; same session as _hh_request_get)",
+        full_url,
+    )
+    response = _hh_send_get(_hh_http_session(), HH_API_VACANCIES_URL, params, timeout)
+    _log_hh_probe_summary("[HH_API_PROBE_NO_TEXT]", response, full_url, params)
+    return 0 if response.status_code == 200 else 1
 
 
 INCLUDE_TITLE_WORDS = [
@@ -71,6 +331,67 @@ def format_salary(salary_data):
     return "Не указана"
 
 
+_HH_TEXT_OPERATOR_TOKENS = frozenset({"and", "not", "or"})
+
+
+def _sanitize_hh_api_outgoing_text(text: str | None) -> str:
+    """
+    Temporary HH API compatibility: outgoing text must be plain words only.
+    Strips boolean operator tokens (AND/NOT/OR), collapses whitespace.
+    """
+    if not text or not str(text).strip():
+        return ""
+    out: list[str] = []
+    for w in str(text).split():
+        w = w.strip()
+        if not w:
+            continue
+        if w.lower() in _HH_TEXT_OPERATOR_TOKENS:
+            continue
+        out.append(w)
+    return " ".join(out)
+
+
+def _plain_hh_search_text(
+    title_keywords: str | None,
+    title_exclude_keywords: str | None,
+    description_keywords: str | None,
+    description_exclude_keywords: str | None,
+    city: str | None,
+) -> str:
+    """
+    Join positive keyword fields + city, strip AND/NOT/OR, drop tokens listed in exclude fields.
+    Exclude columns stay in DB for client-side filters; matched tokens are omitted from HH text.
+    """
+    exclude_lower: set[str] = set()
+    for ex_src in (title_exclude_keywords, description_exclude_keywords):
+        if ex_src and str(ex_src).strip():
+            for w in str(ex_src).split():
+                w = w.strip()
+                if w:
+                    exclude_lower.add(w.lower())
+
+    chunks: list[str] = []
+    for raw in (title_keywords, description_keywords):
+        if raw and str(raw).strip():
+            chunks.append(str(raw).strip())
+    merged = " ".join(chunks)
+    if city and str(city).strip():
+        merged = f"{merged} {city.strip()}".strip() if merged else city.strip()
+
+    tokens: list[str] = []
+    for w in merged.split():
+        w = w.strip()
+        if not w:
+            continue
+        if w.lower() in _HH_TEXT_OPERATOR_TOKENS:
+            continue
+        if w.lower() in exclude_lower:
+            continue
+        tokens.append(w)
+    return " ".join(tokens)
+
+
 def _build_search_text(
     title_keywords: str | None,
     title_exclude_keywords: str | None,
@@ -80,43 +401,21 @@ def _build_search_text(
 ) -> tuple[str, list[str]]:
     """
     Build HH API text and search_field from user inputs.
-    - Keywords: AND between words
-    - Exclude: NOT operator for each excluded word
-    - search_field: name when title, description when description, both when both
 
-    Returns:
-        (text, search_field_list)
+    Temporary compatibility: no AND/NOT in the outgoing HH query — only plain words from
+    positive keyword fields (title + description) and city; operator tokens stripped;
+    words from exclude-keyword fields removed from the HH text token list.
+    search_field is fixed to name-only for this simplified query.
     """
-    text_parts = []
-    search_fields = []
-
-    def _build_part(keywords: str | None, exclude: str | None) -> str:
-        if not keywords or not keywords.strip():
-            return ""
-        words = [w.strip() for w in keywords.split() if w.strip()]
-        part = " AND ".join(words)
-        if exclude and exclude.strip():
-            for ex in exclude.strip().split():
-                ex = ex.strip()
-                if ex:
-                    part += f" NOT {ex}"
-        return part
-
-    title_part = _build_part(title_keywords, title_exclude_keywords)
-    desc_part = _build_part(description_keywords, description_exclude_keywords)
-
-    if title_part:
-        text_parts.append(title_part)
-        search_fields.append("name")
-    if desc_part:
-        text_parts.append(desc_part)
-        search_fields.append("description")
-
-    text = " AND ".join(text_parts) if text_parts else ""
-    if city and city.strip():
-        text = f"{text} {city.strip()}".strip() if text else city.strip()
-
-    return text or "работа", search_fields if search_fields else ["name"]
+    text = _plain_hh_search_text(
+        title_keywords,
+        title_exclude_keywords,
+        description_keywords,
+        description_exclude_keywords,
+        city,
+    )
+    text = text or "работа"
+    return text, ["name"]
 
 
 def get_vacancies_page(page: int, search_params: dict | None = None, per_page: int = 100):
@@ -126,8 +425,6 @@ def get_vacancies_page(page: int, search_params: dict | None = None, per_page: i
     Params match the public API (text, search_field, area, period, salary, etc.).
     See: https://api.hh.ru/openapi/redoc#tag/Poisk-vakansij/operation/get-vacancies
     """
-    url = "https://api.hh.ru/vacancies"
-
     params = {
         "per_page": per_page,
         "page": page,
@@ -155,20 +452,12 @@ def get_vacancies_page(page: int, search_params: dict | None = None, per_page: i
     if "text" not in params:
         params["text"] = "аналитик"
 
-    prepared = requests.Request("GET", url, params=params).prepare()
-    logger.info("[HH_API] get_vacancies_page request URL=%s", prepared.url)
+    cleaned_text = _sanitize_hh_api_outgoing_text(params.get("text") or "")
+    params["text"] = cleaned_text if cleaned_text else "аналитик"
 
-    response = requests.get(url, params=params, timeout=20)
+    logger.info("[HH_API] get_vacancies_page request URL=%s", _hh_full_url(HH_API_VACANCIES_URL, params))
 
-    preview = response.text[:_HH_LOG_TEXT_PREVIEW]
-    logger.info(
-        "[HH_API] get_vacancies_page response status_code=%s text_preview_first_%s_chars=%r",
-        response.status_code,
-        _HH_LOG_TEXT_PREVIEW,
-        preview,
-    )
-
-    response.raise_for_status()
+    response = _hh_request_get(HH_API_VACANCIES_URL, params=params, timeout=20)
 
     try:
         data = response.json()
@@ -193,8 +482,7 @@ def get_vacancies_page(page: int, search_params: dict | None = None, per_page: i
 
 
 def _search_params_from_filter(f) -> dict:
-    """Build HH API search params from a SavedFilter instance.
-    Uses strict search: search_field for title/description, AND/NOT operators."""
+    """Build HH API search params from a SavedFilter instance."""
     text, search_field = _build_search_text(
         title_keywords=getattr(f, "title_keywords", None),
         title_exclude_keywords=getattr(f, "title_exclude_keywords", None),

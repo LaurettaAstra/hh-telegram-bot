@@ -5,8 +5,9 @@ Per-user monitoring: each active user receives only vacancies matching their
 saved filters. Delivery is tracked per filter via filter_vacancy_matches.
 
 First-run baseline: when last_monitoring_at is NULL, we fetch vacancies,
-mark them as baseline (sent) without sending, then set last_monitoring_at.
-This prevents spamming users with historical backlog.
+save new rows to the DB, set last_monitoring_at as a checkpoint, and do not
+send to Telegram. Later runs only consider vacancies with published_at after
+that checkpoint, so the backlog is skipped without marking it as sent.
 """
 
 import asyncio
@@ -19,14 +20,25 @@ if TYPE_CHECKING:
 
 from app.hh_api import _search_params_from_filter, search_vacancies
 from app.repository import (
+    _parse_published_at,
     already_sent,
     filter_new_vacancies,
-    mark_vacancy_sent,
     save_vacancies_to_db,
 )
 from app.user_repository import get_active_users, get_user_monitoring_filters, update_filter_last_monitoring
 
 logger = logging.getLogger(__name__)
+
+
+def _vacancy_published_after_checkpoint(v: dict, checkpoint: datetime) -> bool:
+    """True if vacancy should be considered for monitoring after checkpoint.
+
+    If HH omits published_at, include the row (dedup via already_sent still applies).
+    """
+    pt = _parse_published_at(v.get("published_at"))
+    if pt is None:
+        return True
+    return pt > checkpoint
 
 
 class MonitoringResult(NamedTuple):
@@ -159,7 +171,8 @@ def process_filter_for_user(user, filter_obj) -> list[tuple[dict, int]]:
     Fetch vacancies for filter, return list of (vacancy_dict, filter_id) that have not
     yet been sent to this user for this filter. Deduplication by HH vacancy_id (string).
 
-    First-run baseline: if last_monitoring_at is NULL, mark all as sent without sending.
+    First-run baseline: if last_monitoring_at is NULL, set checkpoint without sending
+    and without marking vacancies as sent.
 
     Does NOT send or mark as sent - caller does that after successful send.
     """
@@ -189,6 +202,13 @@ def process_filter_for_user(user, filter_obj) -> list[tuple[dict, int]]:
         filter_obj.id,
         user.id,
     )
+    logger.info(
+        "[MONITOR_WATERMARK] hh_snapshot filter_id=%s user_id=%s last_monitoring_at=%s total_from_hh=%d",
+        filter_obj.id,
+        user.id,
+        _lma_at_start,
+        len(api_vacancies),
+    )
     if not api_vacancies:
         update_filter_last_monitoring(filter_obj.id, datetime.now(timezone.utc))
         logger.info(
@@ -214,57 +234,41 @@ def process_filter_for_user(user, filter_obj) -> list[tuple[dict, int]]:
         )
         return []
 
-    # First-run baseline: do not send historical backlog, just mark as baseline
+    # First-run baseline: do not send backlog; set last_monitoring_at only (no sent_to_user rows)
     if getattr(filter_obj, "last_monitoring_at", None) is None:
         logger.info(
             "Filter '%s' (id=%s): first-run baseline (last_monitoring_at is NULL), "
-            "marking as sent without Telegram delivery",
+            "setting checkpoint without Telegram delivery or mark_vacancy_sent",
             filter_obj.name,
             filter_obj.id,
         )
         _nv_count = 0
         _save_baseline = "skipped_no_new_rows"
-        baseline_skipped_no_id = 0
         try:
             new_vacancies = filter_new_vacancies(api_vacancies)
             _nv_count = len(new_vacancies)
             if new_vacancies:
                 save_vacancies_to_db(new_vacancies)
                 _save_baseline = "ok"
-            _baseline_no_id_logged = 0
-            for v in api_vacancies:
-                hh_id = str(v.get("id", ""))
-                if not hh_id:
-                    baseline_skipped_no_id += 1
-                    if _baseline_no_id_logged < 3:
-                        _baseline_no_id_logged += 1
-                        logger.info(
-                            "[MONITOR_SKIP] reason=no_vacancy_id (baseline mark loop) filter_id=%s "
-                            "vacancy_keys=%s",
-                            filter_obj.id,
-                            list(v.keys())[:12] if isinstance(v, dict) else type(v).__name__,
-                        )
-                    continue
-                if not already_sent(hh_id, user.id, filter_obj.id):
-                    mark_vacancy_sent(hh_id, user.id, filter_obj.id)
             update_filter_last_monitoring(filter_obj.id, datetime.now(timezone.utc))
             logger.info(
-                "Filter '%s' (id=%s): first-run baseline, %d vacancies marked, no send",
+                "Filter '%s' (id=%s): first-run baseline, checkpoint set, %d vacancies from API "
+                "(new_to_db=%d), no send",
                 filter_obj.name,
                 filter_obj.id,
                 len(api_vacancies),
+                _nv_count,
             )
         except Exception as e:
             logger.exception("First-run baseline failed for filter %s: %s", filter_obj.id, e)
             _save_baseline = "failed"
         logger.info(
             "[MONITOR_SKIP] reason=first_run_baseline (last_monitoring_at was NULL) "
-            "filter_id=%s user_id=%s count_after_process=%s baseline_skipped_no_id=%s — "
-            "all Telegram sends dropped for this filter run; rows marked in DB where possible",
+            "filter_id=%s user_id=%s count_after_process=%s — "
+            "checkpoint only; backlog excluded on later runs via published_at vs last_monitoring_at",
             filter_obj.id,
             user.id,
             len(api_vacancies),
-            baseline_skipped_no_id,
         )
         logger.info(
             "[MONITOR_TRACE] early_return process_filter_for_user reason=baseline_branch "
@@ -280,6 +284,59 @@ def process_filter_for_user(user, filter_obj) -> list[tuple[dict, int]]:
             _nv_count,
         )
         return []
+
+    n_before_watermark = len(api_vacancies)
+    logger.info(
+        "[MONITOR_WATERMARK] before_watermark filter_id=%s user_id=%s last_monitoring_at=%s "
+        "total_from_hh=%d",
+        filter_obj.id,
+        user.id,
+        _lma_at_start,
+        n_before_watermark,
+    )
+    passed_watermark: list[dict] = []
+    dropped_samples: list[dict] = []
+    for v in api_vacancies:
+        if _vacancy_published_after_checkpoint(v, _lma_at_start):
+            passed_watermark.append(v)
+        elif len(dropped_samples) < 3:
+            dropped_samples.append(v)
+    n_after_watermark = len(passed_watermark)
+    n_dropped_watermark = n_before_watermark - n_after_watermark
+    api_vacancies = passed_watermark
+    logger.info(
+        "[MONITOR_WATERMARK] after_watermark filter_id=%s user_id=%s last_monitoring_at=%s "
+        "total_from_hh=%d passed_watermark=%d dropped_by_watermark=%d",
+        filter_obj.id,
+        user.id,
+        _lma_at_start,
+        n_before_watermark,
+        n_after_watermark,
+        n_dropped_watermark,
+    )
+    if n_dropped_watermark and dropped_samples:
+        for v in dropped_samples:
+            raw_pub = v.get("published_at")
+            parsed_pub = _parse_published_at(raw_pub)
+            logger.info(
+                "[MONITOR_WATERMARK] dropped_sample filter_id=%s vacancy_id=%s "
+                "published_at_raw=%r parsed=%s last_monitoring_at=%s",
+                filter_obj.id,
+                v.get("id"),
+                raw_pub,
+                parsed_pub,
+                _lma_at_start,
+            )
+    if n_dropped_watermark:
+        logger.info(
+            "Filter '%s' (id=%s): published_at vs last_monitoring_at dropped %d vacancy/vacancies "
+            "(before=%d after=%d)",
+            filter_obj.name,
+            filter_obj.id,
+            n_dropped_watermark,
+            n_before_watermark,
+            n_after_watermark,
+        )
 
     # Save new vacancies to DB (for search/filters; dedup uses hh_id)
     new_vacancies = filter_new_vacancies(api_vacancies)

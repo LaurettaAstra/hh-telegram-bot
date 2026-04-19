@@ -96,8 +96,7 @@ def _build_inline_keyboard(options: list[tuple[str, str]], prefix: str) -> Inlin
 
 
 def _data_to_search_params(data: dict) -> tuple[dict, SimpleNamespace]:
-    """Build HH API search_params and filter_obj from collected data.
-    Uses strict search: search_field for title/description, AND/NOT operators."""
+    """Build HH API search_params and filter_obj from collected data."""
     text, search_field = _build_search_text(
         title_keywords=data.get("title_keywords"),
         title_exclude_keywords=data.get("title_exclude_keywords"),
