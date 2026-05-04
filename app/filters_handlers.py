@@ -9,10 +9,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app.hh_api import (
+    HHApiError,
     HHAppTokenConfigurationError,
     HHVacanciesForbiddenError,
     _search_params_from_filter,
     search_vacancies_page,
+    vacancy_hh_error_user_message,
 )
 from app.hh_auth import respond_to_vacancies_forbidden
 from app.search_flow import reset_search_conversation
@@ -194,6 +196,9 @@ async def callback_filter_search(update: Update, context: ContextTypes.DEFAULT_T
             update, context, user.id, e, answer_callback=False
         )
         return
+    except HHApiError as e:
+        await query.edit_message_text(vacancy_hh_error_user_message(e))
+        return
     except Exception as e:
         logger.exception("Search failed: %s", e)
         await query.edit_message_text(USER_FRIENDLY_ERROR)
@@ -229,6 +234,9 @@ async def callback_filter_search(update: Update, context: ContextTypes.DEFAULT_T
         await respond_to_vacancies_forbidden(
             update, context, user.id, e, answer_callback=False
         )
+        return
+    except HHApiError as e:
+        await query.edit_message_text(vacancy_hh_error_user_message(e))
         return
     if not success:
         await query.edit_message_text("По вашему запросу вакансии не найдены.")
@@ -357,6 +365,9 @@ def build_filters_handlers(ensure_user_fn):
         except HHAppTokenConfigurationError as ex:
             if u.callback_query:
                 await u.callback_query.edit_message_text(str(ex))
+        except HHApiError as ex:
+            if u.callback_query:
+                await u.callback_query.edit_message_text(vacancy_hh_error_user_message(ex))
         except HHVacanciesForbiddenError as ex:
             uid = c.user_data.get("vacancy_user_id")
             if uid:

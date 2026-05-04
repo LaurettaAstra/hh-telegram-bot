@@ -11,7 +11,14 @@ from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
-from app.hh_api import HHAppTokenConfigurationError, HHVacanciesForbiddenError, _build_search_text, search_vacancies_page
+from app.hh_api import (
+    HHApiError,
+    HHAppTokenConfigurationError,
+    HHVacanciesForbiddenError,
+    _build_search_text,
+    search_vacancies_page,
+    vacancy_hh_error_user_message,
+)
 from app.hh_auth import respond_to_vacancies_forbidden
 from app.user_repository import save_user_filter, USER_FRIENDLY_ERROR
 from app.vacancy_results import _store_search_state, fetch_and_show_page
@@ -435,6 +442,10 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             update, context, user.id, e, answer_callback=False
         )
         return ConversationHandler.END
+    except HHApiError as e:
+        _clear_search_data(context)
+        await query.edit_message_text(vacancy_hh_error_user_message(e))
+        return ConversationHandler.END
     except Exception as e:
         logger.exception("Search failed: %s", e)
         await query.edit_message_text(USER_FRIENDLY_ERROR)
@@ -473,6 +484,10 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await respond_to_vacancies_forbidden(
             update, context, user.id, e, answer_callback=False
         )
+        return ConversationHandler.END
+    except HHApiError as e:
+        _clear_search_data(context)
+        await query.edit_message_text(vacancy_hh_error_user_message(e))
         return ConversationHandler.END
     if not success:
         await query.edit_message_text("По вашему запросу вакансии не найдены.")

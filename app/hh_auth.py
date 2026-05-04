@@ -86,9 +86,12 @@ async def send_hh_authorization_prompt(
             await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
         return
 
-    text = "To continue using the bot, please authorize via HH.ru"
+    text = (
+        "Optional: connect your personal HH.ru applicant account for future bot features. "
+        "Vacancy search already works without this — use /search or saved filters."
+    )
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔐 Authorize HH", url=auth_url)]]
+        [[InlineKeyboardButton("HH applicant (optional)", url=auth_url)]]
     )
 
     if answer_callback and update.callback_query:
@@ -206,14 +209,14 @@ async def run_hh_reauth_notification_pass(bot) -> None:
             logger.warning("[HH_REAUTH] skip notify user_id=%s: %s", fresh.id, e)
             continue
         keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔐 Authorize", url=auth_url)]]
+            [[InlineKeyboardButton("HH applicant (optional)", url=auth_url)]]
         )
         try:
             await bot.send_message(
                 chat_id=fresh.telegram_id,
                 text=(
                     "Опциональное подключение HH.ru (личный аккаунт соискателя) истекло. "
-                    "Поиск вакансий в боте от этого **не зависит**. "
+                    "Поиск вакансий в боте от этого не зависит. "
                     "Подключите снова только если пользуетесь или планируете функции, связанные с вашим профилем HH."
                 ),
                 reply_markup=keyboard,

@@ -15,7 +15,11 @@ from telegram.ext import (
     filters,
 )
 
-from app.config import HH_REAUTH_CHECK_INTERVAL_MINUTES, MONITOR_INTERVAL_MINUTES
+from app.config import (
+    HH_REAUTH_CHECK_INTERVAL_MINUTES,
+    HH_REAUTH_NOTIFICATIONS_ENABLED,
+    MONITOR_INTERVAL_MINUTES,
+)
 from app.config import HH_REDIRECT_URI
 from app.hh_api import HHAuthorizationError, get_hh_authorize_url
 from app.hh_auth import run_hh_reauth_notification_pass
@@ -241,32 +245,37 @@ async def post_init(application: Application):
             MONITOR_INTERVAL_MINUTES,
         )
 
-        async def hh_reauth_fallback_loop():
-            interval_sec = HH_REAUTH_CHECK_INTERVAL_MINUTES * 60
-            first_delay = min(90, interval_sec)
-            while True:
+        if HH_REAUTH_NOTIFICATIONS_ENABLED:
+            async def hh_reauth_fallback_loop():
+                interval_sec = HH_REAUTH_CHECK_INTERVAL_MINUTES * 60
+                first_delay = min(90, interval_sec)
+                while True:
+                    try:
+                        await asyncio.sleep(first_delay)
+                        first_delay = interval_sec
+                        await run_hh_reauth_notification_pass(application.bot)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("HH re-auth fallback loop error")
+
+            rtask = application.create_task(hh_reauth_fallback_loop())
+
+            def _on_reauth_done(t):
                 try:
-                    await asyncio.sleep(first_delay)
-                    first_delay = interval_sec
-                    await run_hh_reauth_notification_pass(application.bot)
-                except asyncio.CancelledError:
-                    raise
+                    t.result()
                 except Exception:
-                    logger.exception("HH re-auth fallback loop error")
+                    logger.exception("HH re-auth fallback loop stopped with error")
 
-        rtask = application.create_task(hh_reauth_fallback_loop())
-
-        def _on_reauth_done(t):
-            try:
-                t.result()
-            except Exception:
-                logger.exception("HH re-auth fallback loop stopped with error")
-
-        rtask.add_done_callback(_on_reauth_done)
-        logger.info(
-            "HH re-auth reminders: asyncio fallback every %d min",
-            HH_REAUTH_CHECK_INTERVAL_MINUTES,
-        )
+            rtask.add_done_callback(_on_reauth_done)
+            logger.info(
+                "HH applicant re-auth reminders: asyncio fallback every %d min",
+                HH_REAUTH_CHECK_INTERVAL_MINUTES,
+            )
+        else:
+            logger.info(
+                "HH applicant re-auth fallback loop not started (HH_REAUTH_NOTIFICATIONS_ENABLED=false)"
+            )
 
 
 def build_application() -> Application:
@@ -293,17 +302,23 @@ def build_application() -> Application:
             "Scheduled monitoring (job_queue): every %d minutes",
             MONITOR_INTERVAL_MINUTES,
         )
-        reauth_seconds = HH_REAUTH_CHECK_INTERVAL_MINUTES * 60
-        app.job_queue.run_repeating(
-            hh_reauth_notification_job_callback,
-            interval=reauth_seconds,
-            first=90,
-            name="hh_reauth_notify",
-        )
-        logger.info(
-            "Scheduled HH re-auth reminders (job_queue): every %d minutes",
-            HH_REAUTH_CHECK_INTERVAL_MINUTES,
-        )
+        if HH_REAUTH_NOTIFICATIONS_ENABLED:
+            reauth_seconds = HH_REAUTH_CHECK_INTERVAL_MINUTES * 60
+            app.job_queue.run_repeating(
+                hh_reauth_notification_job_callback,
+                interval=reauth_seconds,
+                first=90,
+                name="hh_reauth_notify",
+            )
+            logger.info(
+                "Scheduled HH applicant re-auth reminders (job_queue): every %d minutes",
+                HH_REAUTH_CHECK_INTERVAL_MINUTES,
+            )
+        else:
+            logger.info(
+                "HH applicant re-auth reminders disabled (HH_REAUTH_NOTIFICATIONS_ENABLED unset/false); "
+                "vacancy search does not use applicant tokens"
+            )
     else:
         logger.warning(
             "Job queue not available; monitoring uses asyncio fallback in post_init"

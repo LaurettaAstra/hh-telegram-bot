@@ -8,7 +8,12 @@ import math
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.hh_api import HHAppTokenConfigurationError, HHVacanciesForbiddenError, search_vacancies_page
+from app.hh_api import (
+    HHApiError,
+    HHAppTokenConfigurationError,
+    HHVacanciesForbiddenError,
+    search_vacancies_page,
+)
 from app.notifier import format_vacancies_page_header, format_vacancy_single_message
 
 logger = logging.getLogger(__name__)
@@ -81,6 +86,8 @@ async def fetch_and_show_page(
     except HHVacanciesForbiddenError:
         raise
     except HHAppTokenConfigurationError:
+        raise
+    except HHApiError:
         raise
     except Exception as e:
         logger.exception("search_vacancies_page failed: %s", e)

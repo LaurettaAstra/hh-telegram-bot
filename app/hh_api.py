@@ -220,6 +220,22 @@ class HHAppTokenConfigurationError(Exception):
     """Missing or empty env vars required for HH application token (client_credentials) / vacancy search."""
 
 
+def vacancy_hh_error_user_message(exc: Exception, *, max_detail: int = 900) -> str:
+    """
+    User-visible text for vacancy GET failures (token endpoint or /vacancies), without implying
+    applicant OAuth is required for search.
+    """
+    detail = (str(exc) or type(exc).__name__).strip()
+    if len(detail) > max_detail:
+        detail = detail[: max_detail - 3] + "..."
+    return (
+        "HH.ru vacancy request failed (application authorization). "
+        "Applicant HH login is not required for vacancy search and will not fix this. "
+        "Technical detail:\n\n"
+        f"{detail}"
+    )
+
+
 def _require_hh_app_oauth_env() -> None:
     missing: list[str] = []
     if not (HH_CLIENT_ID or "").strip():
