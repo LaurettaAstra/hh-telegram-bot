@@ -7,5 +7,5 @@ __pycache__/
 .vscode/
 .idea/
 
-.DS_Storevenv/
+.DS_Store
 venv/
