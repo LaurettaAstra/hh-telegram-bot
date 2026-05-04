@@ -4,6 +4,7 @@ Repository layer for users and saved filters.
 
 import logging
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
@@ -14,6 +15,12 @@ from app.models import SavedFilter, User
 logger = logging.getLogger(__name__)
 
 USER_FRIENDLY_ERROR = "Не удалось обработать запрос. Попробуйте ещё раз позже."
+
+
+class HHTokenBundle(NamedTuple):
+    access_token: str
+    refresh_token: str | None
+    expires_at: datetime | None
 
 
 def get_or_create_user(
@@ -136,6 +143,45 @@ def get_user_filters(user_id: int) -> list[SavedFilter]:
             select(SavedFilter).where(SavedFilter.user_id == user_id).order_by(SavedFilter.id)
         )
         return list(result.scalars().all())
+    finally:
+        session.close()
+
+
+def list_users_expired_hh_pending_notification() -> list[User]:
+    """
+    Users with non-null HH tokens and expires_at in the past,
+    who have not yet received the one-time passive re-auth Telegram notice.
+    """
+    session = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        result = session.execute(
+            select(User).where(
+                User.hh_access_token.isnot(None),
+                User.hh_expires_at.isnot(None),
+                User.hh_expires_at < now,
+                User.hh_reauth_notified == False,
+            )
+        )
+        return list(result.scalars().all())
+    finally:
+        session.close()
+
+
+def set_hh_reauth_notified(user_id: int, notified: bool = True) -> bool:
+    """Persist hh_reauth_notified flag; returns False if user missing."""
+    session = SessionLocal()
+    try:
+        result = session.execute(select(User).where(User.id == user_id))
+        user = result.scalars().first()
+        if not user:
+            return False
+        user.hh_reauth_notified = notified
+        session.commit()
+        return True
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()
 
@@ -277,5 +323,99 @@ def delete_user_filter(filter_id: int, user_id: int) -> bool:
         session.rollback()
         raise
 
+    finally:
+        session.close()
+
+
+def get_user_by_telegram_id(telegram_id: int) -> User | None:
+    """Get user by Telegram ID."""
+    session = SessionLocal()
+    try:
+        result = session.execute(select(User).where(User.telegram_id == telegram_id))
+        return result.scalars().first()
+    finally:
+        session.close()
+
+
+def get_user_by_id(user_id: int) -> User | None:
+    """Get user by internal DB id."""
+    session = SessionLocal()
+    try:
+        result = session.execute(select(User).where(User.id == user_id))
+        return result.scalars().first()
+    finally:
+        session.close()
+
+
+def _strip_hh_secret(value: str | None) -> str | None:
+    """Avoid stray whitespace/newlines from OAuth responses breaking Bearer auth."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s if s else None
+
+
+def get_user_hh_tokens(user_id: int) -> HHTokenBundle | None:
+    """Return HH token bundle for user if access token exists."""
+    session = SessionLocal()
+    try:
+        result = session.execute(select(User).where(User.id == user_id))
+        user = result.scalars().first()
+        if not user or not user.hh_access_token:
+            return None
+        at = _strip_hh_secret(user.hh_access_token)
+        if not at:
+            return None
+        return HHTokenBundle(
+            access_token=at,
+            refresh_token=_strip_hh_secret(user.hh_refresh_token),
+            expires_at=user.hh_expires_at,
+        )
+    finally:
+        session.close()
+
+
+def save_user_hh_tokens(
+    user_id: int,
+    access_token: str,
+    refresh_token: str | None,
+    expires_at: datetime | None,
+) -> bool:
+    """Persist HH OAuth tokens for user."""
+    session = SessionLocal()
+    try:
+        result = session.execute(select(User).where(User.id == user_id))
+        user = result.scalars().first()
+        if not user:
+            return False
+        user.hh_access_token = _strip_hh_secret(access_token)
+        user.hh_refresh_token = _strip_hh_secret(refresh_token)
+        user.hh_expires_at = expires_at
+        user.hh_reauth_notified = False
+        session.commit()
+        return True
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def clear_user_hh_tokens(user_id: int) -> bool:
+    """Remove stored HH tokens (e.g. after HTTP 403 / revoked access)."""
+    session = SessionLocal()
+    try:
+        result = session.execute(select(User).where(User.id == user_id))
+        user = result.scalars().first()
+        if not user:
+            return False
+        user.hh_access_token = None
+        user.hh_refresh_token = None
+        user.hh_expires_at = None
+        session.commit()
+        return True
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()

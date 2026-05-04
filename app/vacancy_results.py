@@ -8,7 +8,7 @@ import math
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.hh_api import search_vacancies_page
+from app.hh_api import HHAppTokenConfigurationError, HHVacanciesForbiddenError, search_vacancies_page
 from app.notifier import format_vacancies_page_header, format_vacancy_single_message
 
 logger = logging.getLogger(__name__)
@@ -34,21 +34,23 @@ def _build_pagination_keyboard(total: int, current_page: int) -> InlineKeyboardM
     return InlineKeyboardMarkup(buttons)
 
 
-def _get_search_state(context) -> tuple[dict, object, int] | None:
-    """Get stored search state from user_data. Returns (search_params, filter_obj, period) or None."""
+def _get_search_state(context) -> tuple[dict, object, int, int | None] | None:
+    """Get stored search state from user_data."""
     params = context.user_data.get("vacancy_search_params")
     period = context.user_data.get("vacancy_period")
     if params is None or period is None:
         return None
     filter_obj = context.user_data.get("vacancy_filter_obj")
-    return params, filter_obj, period
+    user_id = context.user_data.get("vacancy_user_id")
+    return params, filter_obj, period, user_id
 
 
-def _store_search_state(context, search_params: dict, filter_obj, period: int) -> None:
+def _store_search_state(context, search_params: dict, filter_obj, period: int, user_id: int | None = None) -> None:
     """Store search state for pagination callbacks."""
     context.user_data["vacancy_search_params"] = search_params
     context.user_data["vacancy_filter_obj"] = filter_obj
     context.user_data["vacancy_period"] = period
+    context.user_data["vacancy_user_id"] = user_id
 
 
 async def fetch_and_show_page(
@@ -59,6 +61,9 @@ async def fetch_and_show_page(
     period: int,
     chat_id: int,
     message_id: int,
+    user_id: int | None = None,
+    *,
+    source: str = "vacancy_results.fetch_page",
 ) -> bool:
     """
     Fetch page from HH API, edit header with pagination, send each vacancy as separate message,
@@ -66,7 +71,17 @@ async def fetch_and_show_page(
     Returns True on success, False if no vacancies.
     """
     try:
-        found, vacancies = search_vacancies_page(page, search_params, filter_obj)
+        found, vacancies = search_vacancies_page(
+            page,
+            search_params,
+            filter_obj,
+            user_id=user_id,
+            source=source,
+        )
+    except HHVacanciesForbiddenError:
+        raise
+    except HHAppTokenConfigurationError:
+        raise
     except Exception as e:
         logger.exception("search_vacancies_page failed: %s", e)
         return False
@@ -145,7 +160,7 @@ async def handle_vacancy_page_callback(update, context):
         await query.edit_message_text("Сессия поиска истекла. Запустите поиск заново.")
         return
 
-    search_params, filter_obj, period = state
+    search_params, filter_obj, period, user_id = state
 
     success = await fetch_and_show_page(
         context,
@@ -155,6 +170,8 @@ async def handle_vacancy_page_callback(update, context):
         period,
         query.message.chat_id,
         query.message.message_id,
+        user_id=user_id,
+        source="vacancy_results.pagination",
     )
 
     if not success:

@@ -11,7 +11,8 @@ from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
-from app.hh_api import _build_search_text, search_vacancies_page
+from app.hh_api import HHAppTokenConfigurationError, HHVacanciesForbiddenError, _build_search_text, search_vacancies_page
+from app.hh_auth import respond_to_vacancies_forbidden
 from app.user_repository import save_user_filter, USER_FRIENDLY_ERROR
 from app.vacancy_results import _store_search_state, fetch_and_show_page
 
@@ -400,6 +401,14 @@ async def receive_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Execute search and show first page with pagination."""
     query = update.callback_query
+
+    user = context.user_data.get("search_user")
+    if not user:
+        await query.answer()
+        await query.edit_message_text("Сессия поиска истекла. Запустите поиск заново.")
+        _clear_search_data(context)
+        return ConversationHandler.END
+
     await query.answer()
 
     data = _get_search_data(context)
@@ -409,7 +418,23 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.edit_message_text("Ищу вакансии...")
 
     try:
-        found, vacancies = search_vacancies_page(0, search_params, filter_obj)
+        found, vacancies = search_vacancies_page(
+            0,
+            search_params,
+            filter_obj,
+            user_id=user.id,
+            source="search_flow.run_search",
+        )
+    except HHAppTokenConfigurationError as e:
+        _clear_search_data(context)
+        await query.edit_message_text(str(e))
+        return ConversationHandler.END
+    except HHVacanciesForbiddenError as e:
+        _clear_search_data(context)
+        await respond_to_vacancies_forbidden(
+            update, context, user.id, e, answer_callback=False
+        )
+        return ConversationHandler.END
     except Exception as e:
         logger.exception("Search failed: %s", e)
         await query.edit_message_text(USER_FRIENDLY_ERROR)
@@ -426,11 +451,29 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         _clear_search_data(context)
         return ConversationHandler.END
 
-    _store_search_state(context, search_params, filter_obj, period)
-    success = await fetch_and_show_page(
-        context, 0, search_params, filter_obj, period,
-        query.message.chat_id, query.message.message_id,
-    )
+    _store_search_state(context, search_params, filter_obj, period, user_id=user.id)
+    try:
+        success = await fetch_and_show_page(
+            context,
+            0,
+            search_params,
+            filter_obj,
+            period,
+            query.message.chat_id,
+            query.message.message_id,
+            user_id=user.id,
+            source="search_flow.fetch_page",
+        )
+    except HHAppTokenConfigurationError as e:
+        _clear_search_data(context)
+        await query.edit_message_text(str(e))
+        return ConversationHandler.END
+    except HHVacanciesForbiddenError as e:
+        _clear_search_data(context)
+        await respond_to_vacancies_forbidden(
+            update, context, user.id, e, answer_callback=False
+        )
+        return ConversationHandler.END
     if not success:
         await query.edit_message_text("По вашему запросу вакансии не найдены.")
         _clear_search_data(context)

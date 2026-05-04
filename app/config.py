@@ -11,8 +11,13 @@ load_dotenv()
 # Monitoring interval in minutes (how often to check HH for new vacancies)
 MONITOR_INTERVAL_MINUTES = int(os.getenv("MONITOR_INTERVAL_MINUTES", "5"))
 
-# HH.ru client identification (HH-User-Agent). Override with HH_API_HH_USER_AGENT if needed.
-HH_API_HH_USER_AGENT = os.getenv(
-    "HH_API_HH_USER_AGENT",
-    "LaurettaAstra HH Telegram Bot/1.0 (romanova.mekcorp@gmail.com)",
-)
+# Passive HH re-auth Telegram reminder (expired tokens); separate from vacancy monitoring
+HH_REAUTH_CHECK_INTERVAL_MINUTES = int(os.getenv("HH_REAUTH_CHECK_INTERVAL_MINUTES", "15"))
+
+# HH.ru client identification (HH-User-Agent). Required for api.hh.ru; set HH_API_HH_USER_AGENT in .env.
+HH_API_HH_USER_AGENT = (os.getenv("HH_API_HH_USER_AGENT") or "").strip()
+
+# HH OAuth2 credentials
+HH_CLIENT_ID = os.getenv("HH_CLIENT_ID", "")
+HH_CLIENT_SECRET = os.getenv("HH_CLIENT_SECRET", "")
+HH_REDIRECT_URI = os.getenv("HH_REDIRECT_URI", "")

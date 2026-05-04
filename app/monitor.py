@@ -18,14 +18,18 @@ from typing import TYPE_CHECKING, NamedTuple
 if TYPE_CHECKING:
     from telegram import Bot
 
-from app.hh_api import _search_params_from_filter, search_vacancies
+from app.hh_api import HHVacanciesForbiddenError, _search_params_from_filter, search_vacancies
 from app.repository import (
     _parse_published_at,
     already_sent,
     filter_new_vacancies,
     save_vacancies_to_db,
 )
-from app.user_repository import get_active_users, get_user_monitoring_filters, update_filter_last_monitoring
+from app.user_repository import (
+    get_active_users,
+    get_user_monitoring_filters,
+    update_filter_last_monitoring,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +192,19 @@ def process_filter_for_user(user, filter_obj) -> list[tuple[dict, int]]:
     )
     search_params = _search_params_from_filter(filter_obj)
     search_params["period"] = 1  # Only last day's vacancies for monitoring
-    api_vacancies = search_vacancies(search_params=search_params, filter_obj=filter_obj)
+    try:
+        api_vacancies = search_vacancies(
+            search_params=search_params, filter_obj=filter_obj, user_id=user.id
+        )
+    except HHVacanciesForbiddenError as exc:
+        logger.warning(
+            "[MONITOR] HH vacancies 403 application_auth user_id=%s filter_id=%s "
+            "prompt_reauthorize=%s (applicant OAuth is not used for /vacancies; do not clear user tokens)",
+            user.id,
+            filter_obj.id,
+            getattr(exc, "prompt_reauthorize", False),
+        )
+        return []
     logger.info(
         "Filter '%s' (id=%s): HH API returned %d vacancy/vacancies (after client-side filters, period=1)",
         filter_obj.name,

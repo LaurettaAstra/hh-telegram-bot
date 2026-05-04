@@ -8,7 +8,13 @@ import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from app.hh_api import _search_params_from_filter, search_vacancies_page
+from app.hh_api import (
+    HHAppTokenConfigurationError,
+    HHVacanciesForbiddenError,
+    _search_params_from_filter,
+    search_vacancies_page,
+)
+from app.hh_auth import respond_to_vacancies_forbidden
 from app.search_flow import reset_search_conversation
 from app.vacancy_results import _store_search_state, fetch_and_show_page, handle_vacancy_page_callback
 from app.user_repository import (
@@ -142,34 +148,52 @@ async def callback_filter_search(update: Update, context: ContextTypes.DEFAULT_T
     """User tapped Начать поиск - run vacancy search with this filter."""
     await reset_search_conversation(context.application, update)
     query = update.callback_query
-    await query.answer()
 
     user, err = ensure_user_fn(update)
     if err:
+        await query.answer()
         await query.edit_message_text(err)
         return
 
     parts = query.data.split(":", 1)
     if len(parts) != 2:
+        await query.answer()
         await query.edit_message_text("Ошибка.")
         return
     try:
         filter_id = int(parts[1])
     except ValueError:
+        await query.answer()
         await query.edit_message_text("Ошибка.")
         return
 
     f = get_user_filter_by_id(filter_id, user.id)
     if not f:
+        await query.answer()
         await query.edit_message_text("Фильтр не найден.")
         return
 
+    await query.answer()
     await query.edit_message_text("Ищу вакансии...")
 
     try:
         search_params = _search_params_from_filter(f)
         search_params["period"] = 30
-        found, vacancies = search_vacancies_page(0, search_params, filter_obj=f)
+        found, vacancies = search_vacancies_page(
+            0,
+            search_params,
+            filter_obj=f,
+            user_id=user.id,
+            source="filters.saved_search",
+        )
+    except HHAppTokenConfigurationError as e:
+        await query.edit_message_text(str(e))
+        return
+    except HHVacanciesForbiddenError as e:
+        await respond_to_vacancies_forbidden(
+            update, context, user.id, e, answer_callback=False
+        )
+        return
     except Exception as e:
         logger.exception("Search failed: %s", e)
         await query.edit_message_text(USER_FRIENDLY_ERROR)
@@ -185,11 +209,27 @@ async def callback_filter_search(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     period = 30
-    _store_search_state(context, search_params, f, period)
-    success = await fetch_and_show_page(
-        context, 0, search_params, f, period,
-        query.message.chat_id, query.message.message_id,
-    )
+    _store_search_state(context, search_params, f, period, user_id=user.id)
+    try:
+        success = await fetch_and_show_page(
+            context,
+            0,
+            search_params,
+            f,
+            period,
+            query.message.chat_id,
+            query.message.message_id,
+            user_id=user.id,
+            source="filters.fetch_page",
+        )
+    except HHAppTokenConfigurationError as e:
+        await query.edit_message_text(str(e))
+        return
+    except HHVacanciesForbiddenError as e:
+        await respond_to_vacancies_forbidden(
+            update, context, user.id, e, answer_callback=False
+        )
+        return
     if not success:
         await query.edit_message_text("По вашему запросу вакансии не найдены.")
 
@@ -312,7 +352,17 @@ def build_filters_handlers(ensure_user_fn):
                 await u.callback_query.answer()
                 await u.callback_query.edit_message_text(err)
             return
-        await handle_vacancy_page_callback(u, c)
+        try:
+            await handle_vacancy_page_callback(u, c)
+        except HHAppTokenConfigurationError as ex:
+            if u.callback_query:
+                await u.callback_query.edit_message_text(str(ex))
+        except HHVacanciesForbiddenError as ex:
+            uid = c.user_data.get("vacancy_user_id")
+            if uid:
+                await respond_to_vacancies_forbidden(
+                    u, c, uid, ex, answer_callback=False
+                )
 
     return [
         CommandHandler("filters", wrap_filters),

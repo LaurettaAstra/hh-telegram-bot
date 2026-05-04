@@ -1,11 +1,20 @@
 import json
 import logging
+import secrets
+import threading
 import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import requests
 
-from app.config import HH_API_HH_USER_AGENT
+from app.config import (
+    HH_API_HH_USER_AGENT,
+    HH_CLIENT_ID,
+    HH_CLIENT_SECRET,
+    HH_REDIRECT_URI,
+)
+from app.user_repository import get_user_by_id, get_user_hh_tokens, save_user_hh_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +33,24 @@ _HH_LOG_BODY_MAX = 1000
 # Delay before one retry on 403, 5xx, or timeout (seconds).
 _HH_RETRY_DELAY_SEC = 2.5
 
+# GET /vacancies (HH OpenAPI) requires **application** OAuth (client_credentials) or **employer**
+# user authorization. Applicant (соискатель) user tokens and unauthenticated calls return 403.
+# Vacancy search uses application Bearer from ``get_hh_app_access_token``. Applicant OAuth remains
+# for future user-specific HH features (e.g. responses, resumes) and ``/me`` diagnostics.
 HH_API_VACANCIES_URL = "https://api.hh.ru/vacancies"
+HH_API_ME_URL = "https://api.hh.ru/me"
+HH_OAUTH_AUTHORIZE_URL = "https://hh.ru/oauth/authorize"
+HH_OAUTH_TOKEN_URL = "https://hh.ru/oauth/token"
 
-# Lazily populated on first call to _hh_request_get — single shared client for all api.hh.ru GETs.
+# Lazily populated on first call to _hh_http_session — single shared client for all api.hh.ru GETs.
 _HH_HTTP_CLIENT: requests.Session | None = None
+_HH_OAUTH_STATE: dict[str, int] = {}
+_HH_OAUTH_STATE_LOCK = threading.Lock()
+
+# In-memory application access token (client_credentials). Not persisted to DB or ``users``.
+_hh_app_access_token: str | None = None
+_hh_app_access_token_expires_at: datetime | None = None
+_HH_APP_TOKEN_LOCK = threading.Lock()
 
 
 def _hh_full_url(base_url: str, params: dict) -> str:
@@ -111,8 +134,14 @@ def _log_hh_round_trip_diagnostics(
     )
 
 
-def _hh_send_get(session: requests.Session, url: str, params: dict, timeout: float) -> requests.Response:
-    req = requests.Request("GET", url, params=params)
+def _hh_send_get(
+    session: requests.Session,
+    url: str,
+    params: dict,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+) -> requests.Response:
+    req = requests.Request("GET", url, params=params, headers=headers)
     prepared = session.prepare_request(req)
     _hh_drop_duplicate_user_agent(prepared)
     _log_hh_outgoing_headers(prepared)
@@ -160,24 +189,492 @@ class HHApiError(Exception):
         self.response_body_preview = response_body_preview
 
 
+class HHVacanciesForbiddenError(HHApiError):
+    """HH returned 403 for a vacancy-list/search GET (Bearer or anonymous)."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        user_id: int | None = None,
+        status_code: int | None = None,
+        url: str | None = None,
+        response_body_preview: str | None = None,
+        prompt_reauthorize: bool = True,
+    ):
+        super().__init__(
+            message,
+            status_code=status_code,
+            url=url,
+            response_body_preview=response_body_preview,
+        )
+        self.user_id = user_id
+        self.prompt_reauthorize = prompt_reauthorize
+
+
+class HHAuthorizationError(Exception):
+    """HH OAuth2 authorization flow error."""
+
+
+class HHAppTokenConfigurationError(Exception):
+    """Missing or empty env vars required for HH application token (client_credentials) / vacancy search."""
+
+
+def _require_hh_app_oauth_env() -> None:
+    missing: list[str] = []
+    if not (HH_CLIENT_ID or "").strip():
+        missing.append("HH_CLIENT_ID")
+    if not (HH_CLIENT_SECRET or "").strip():
+        missing.append("HH_CLIENT_SECRET")
+    if not (HH_API_HH_USER_AGENT or "").strip():
+        missing.append("HH_API_HH_USER_AGENT")
+    if missing:
+        raise HHAppTokenConfigurationError(
+            "Vacancy search requires HH application OAuth. Set these environment variables: "
+            + ", ".join(missing)
+        )
+
+
+def _invalidate_hh_app_access_token_cache() -> None:
+    global _hh_app_access_token, _hh_app_access_token_expires_at
+    with _HH_APP_TOKEN_LOCK:
+        _hh_app_access_token = None
+        _hh_app_access_token_expires_at = None
+
+
+def get_hh_app_access_token() -> str:
+    """
+    Return OAuth access token for the registered HH **application** (grant client_credentials).
+
+    Cached in memory until shortly before HH ``expires_in`` (refresh 60 seconds early).
+    """
+    _require_hh_app_oauth_env()
+    global _hh_app_access_token, _hh_app_access_token_expires_at
+    now = datetime.now(timezone.utc)
+    margin = timedelta(seconds=60)
+    with _HH_APP_TOKEN_LOCK:
+        if (
+            _hh_app_access_token
+            and _hh_app_access_token_expires_at
+            and now < _hh_app_access_token_expires_at - margin
+        ):
+            logger.info(
+                "[HH_APP_TOKEN] reused=%s expires_at=%s",
+                True,
+                _hh_app_access_token_expires_at.isoformat(),
+            )
+            return _hh_app_access_token
+
+    data = _request_hh_token(
+        {
+            "grant_type": "client_credentials",
+            "client_id": HH_CLIENT_ID.strip(),
+            "client_secret": HH_CLIENT_SECRET.strip(),
+        }
+    )
+    raw = data["access_token"]
+    exp_in = data.get("expires_in")
+    try:
+        sec = int(exp_in) if exp_in is not None else 3600
+    except (TypeError, ValueError):
+        sec = 3600
+    wall = datetime.now(timezone.utc) + timedelta(seconds=sec)
+    logger.info(
+        "[HH_APP_TOKEN] requested_new expires_at=%s",
+        wall.isoformat(),
+    )
+    with _HH_APP_TOKEN_LOCK:
+        _hh_app_access_token = raw
+        _hh_app_access_token_expires_at = wall
+        return raw
+
+
+def _log_access_token_used(user_id: int, raw_token: str, attempt: int, note: str) -> None:
+    """Safe token fingerprint for debugging (no full secret)."""
+    user = get_user_by_id(user_id)
+    telegram_id = user.telegram_id if user else None
+    tl = len(raw_token)
+    prefix = raw_token[:6] if tl >= 6 else raw_token
+    bearer_ok = raw_token.strip() == raw_token and tl > 0
+    logger.info(
+        "[HH_TOKEN_USE] user_id=%s telegram_id=%s attempt=%s token_len=%s token_prefix=%s "
+        "strip_clean=%s hh_user_agent_configured=%s note=%s",
+        user_id,
+        telegram_id,
+        attempt + 1,
+        tl,
+        prefix,
+        bearer_ok,
+        bool(HH_API_HH_USER_AGENT and str(HH_API_HH_USER_AGENT).strip()),
+        note,
+    )
+
+
+def _log_hh_response_errors(status: int, body_preview: str, user_id: int | None, ctx: str) -> None:
+    """Log HH JSON errors[].type / errors[].value (no secrets)."""
+    try:
+        parsed = json.loads(body_preview)
+    except json.JSONDecodeError:
+        logger.warning(
+            "[HH_DIAG_ERRORS] ctx=%s status=%s user_id=%s json_parse_failed preview=%r",
+            ctx,
+            status,
+            user_id,
+            body_preview[:400],
+        )
+        return
+    if not isinstance(parsed, dict):
+        return
+    req_id = parsed.get("request_id")
+    errors = parsed.get("errors")
+    if isinstance(errors, list):
+        for i, err in enumerate(errors[:10]):
+            if isinstance(err, dict):
+                logger.warning(
+                    "[HH_DIAG_ERRORS] ctx=%s status=%s user_id=%s idx=%s type=%s value=%s request_id=%s",
+                    ctx,
+                    status,
+                    user_id,
+                    i,
+                    err.get("type"),
+                    err.get("value"),
+                    req_id,
+                )
+        if status == 403:
+            _log_hh_403_hints(errors, user_id)
+    elif status >= 400:
+        logger.warning("[HH_DIAG_ERRORS] ctx=%s status=%s user_id=%s no_errors_array keys=%s", ctx, status, user_id, list(parsed.keys()))
+
+
+def _log_hh_403_hints(errors: list, user_id: int | None) -> None:
+    """Narrative hints based on HH API error docs (github.com/hhru/api)."""
+    pairs: list[tuple[object, object]] = []
+    values: list[str] = []
+    for err in errors:
+        if isinstance(err, dict):
+            t, v = err.get("type"), err.get("value")
+            pairs.append((t, v))
+            if isinstance(v, str):
+                values.append(v)
+    logger.error("[HH_DIAG_403] user_id=%s errors_pairs=%s", user_id, pairs)
+    if any(v == "user_auth_expected" for v in values):
+        logger.error(
+            "[HH_DIAG_403_HINT] user_id=%s HH API says user OAuth is required for this call "
+            "(application-only token is not enough).",
+            user_id,
+        )
+    if any(v in ("bad_authorization", "token_expired", "token_revoked") for v in values):
+        logger.error(
+            "[HH_DIAG_403_HINT] user_id=%s OAuth token rejected by HH — re-authorize or refresh.",
+            user_id,
+        )
+    if any(v == "application_not_found" for v in values):
+        logger.error("[HH_DIAG_403_HINT] user_id=%s OAuth application deleted or invalid client_id.", user_id)
+    if pairs and all(t == "forbidden" and v in (None, "") for t, v in pairs):
+        logger.error(
+            "[HH_DIAG_403_HINT] user_id=%s Generic forbidden (no structured oauth value). Often: "
+            "application lacks OpenAPI/API access in https://dev.hh.ru cabinet, HH rate/app policy, "
+            "or wrong token class — not caused by vacancy query params like period/schedule alone.",
+            user_id,
+        )
+
+
+def _hh_forbidden_should_prompt_reauth(body_preview: str) -> bool:
+    """
+    False when HH returns only a bare errors[{'type':'forbidden'}] without oauth `value`
+    (typical app/OpenAPI restriction): re-authorization will not fix vacancy 403.
+    True when oauth/token hints appear — user should reconnect OAuth or refresh.
+    """
+    try:
+        parsed = json.loads(body_preview)
+    except json.JSONDecodeError:
+        return True
+    errors = parsed.get("errors") if isinstance(parsed, dict) else None
+    if not isinstance(errors, list):
+        return True
+    oauth_values = {
+        "bad_authorization",
+        "token_expired",
+        "token_revoked",
+        "user_auth_expected",
+        "application_not_found",
+    }
+    for err in errors:
+        if isinstance(err, dict):
+            if err.get("type") == "oauth":
+                return True
+            v = err.get("value")
+            if isinstance(v, str) and v in oauth_values:
+                return True
+    if (
+        len(errors) == 1
+        and isinstance(errors[0], dict)
+        and errors[0].get("type") == "forbidden"
+        and errors[0].get("value") in (None, "")
+    ):
+        return False
+    return True
+
+
+def _oauth_expires_at(expires_in: int | None) -> datetime | None:
+    if not expires_in:
+        return None
+    return datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
+
+
+def get_hh_authorize_url(user_id: int) -> str:
+    """Build HH OAuth authorize URL and store state -> user mapping."""
+    if not HH_CLIENT_ID or not HH_REDIRECT_URI:
+        raise HHAuthorizationError("HH OAuth config is missing (HH_CLIENT_ID / HH_REDIRECT_URI)")
+    state = secrets.token_urlsafe(24)
+    with _HH_OAUTH_STATE_LOCK:
+        _HH_OAUTH_STATE[state] = user_id
+    params = {
+        "response_type": "code",
+        "client_id": HH_CLIENT_ID,
+        "redirect_uri": HH_REDIRECT_URI,
+        "state": state,
+    }
+    return f"{HH_OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
+
+
+def resolve_user_id_from_state(state: str) -> int | None:
+    """One-time read of stored OAuth state."""
+    if not state:
+        return None
+    with _HH_OAUTH_STATE_LOCK:
+        return _HH_OAUTH_STATE.pop(state, None)
+
+
+def _request_hh_token(payload: dict[str, str]) -> dict:
+    grant = payload.get("grant_type", "?")
+    redirect_present = "redirect_uri" in payload
+    logger.info(
+        "[HH_OAUTH_HTTP] POST %s grant_type=%s redirect_uri_in_body=%s client_id_present=%s",
+        HH_OAUTH_TOKEN_URL,
+        grant,
+        redirect_present,
+        bool(payload.get("client_id")),
+    )
+    response = requests.post(
+        HH_OAUTH_TOKEN_URL,
+        data=payload,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        timeout=20,
+    )
+    logger.info("[HH_OAUTH_HTTP] token_endpoint_http_status=%s grant_type=%s", response.status_code, grant)
+    if response.status_code != 200:
+        body = response.text[:_HH_LOG_BODY_MAX]
+        try:
+            ej = json.loads(body)
+            if isinstance(ej, dict):
+                logger.warning(
+                    "[HH_OAUTH_HTTP] token_endpoint_error error=%r error_description=%r",
+                    ej.get("error"),
+                    ej.get("error_description"),
+                )
+        except json.JSONDecodeError:
+            pass
+        _log_hh_response_errors(response.status_code, body, None, "oauth_token_endpoint")
+        raise HHAuthorizationError(f"Token request failed HTTP {response.status_code}: {body}")
+    data = response.json()
+    if not isinstance(data, dict) or "access_token" not in data:
+        raise HHAuthorizationError("Token response does not contain access_token")
+    logger.info(
+        "[HH_OAUTH_HTTP] token_json_keys=%s expires_in=%s refresh_token_present=%s token_type=%s",
+        sorted(data.keys()),
+        data.get("expires_in"),
+        bool(data.get("refresh_token")),
+        data.get("token_type"),
+    )
+    return data
+
+
+def exchange_code_and_save_tokens(user_id: int, code: str) -> None:
+    """Exchange authorization code for tokens and persist for user."""
+    if not HH_CLIENT_ID or not HH_CLIENT_SECRET or not HH_REDIRECT_URI:
+        raise HHAuthorizationError(
+            "HH OAuth config is missing (HH_CLIENT_ID / HH_CLIENT_SECRET / HH_REDIRECT_URI)"
+        )
+    data = _request_hh_token(
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": HH_CLIENT_ID,
+            "client_secret": HH_CLIENT_SECRET,
+            "redirect_uri": HH_REDIRECT_URI,
+        }
+    )
+    expires_at = _oauth_expires_at(data.get("expires_in"))
+    access_raw = data["access_token"]
+    ok = save_user_hh_tokens(
+        user_id,
+        access_token=access_raw,
+        refresh_token=data.get("refresh_token"),
+        expires_at=expires_at,
+    )
+    if not ok:
+        raise HHAuthorizationError(f"User {user_id} not found for token storage")
+    user_row = get_user_by_id(user_id)
+    telegram_id = user_row.telegram_id if user_row else None
+    at_saved = user_row.hh_access_token if user_row else ""
+    logger.info(
+        "[HH_OAUTH_EXCHANGE_OK] user_id=%s telegram_id=%s internal_mapping_ok=true "
+        "access_token_len_saved=%s access_token_prefix=%s expires_at=%s expires_in_json=%s "
+        "refresh_saved_present=%s token_event=fresh_from_authorization_code",
+        user_id,
+        telegram_id,
+        len(at_saved) if at_saved else 0,
+        (at_saved[:6] if at_saved and len(at_saved) >= 6 else at_saved or ""),
+        expires_at,
+        data.get("expires_in"),
+        bool(user_row.hh_refresh_token if user_row else False),
+    )
+    oauth_probe_authenticated_me(user_id)
+
+
+def refresh_user_hh_token(user_id: int) -> str:
+    """Refresh expired HH access token and return new access token."""
+    tokens = get_user_hh_tokens(user_id)
+    if not tokens or not tokens.refresh_token:
+        raise HHAuthorizationError("Missing refresh_token; reconnect HH account")
+    data = _request_hh_token(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": tokens.refresh_token,
+            "client_id": HH_CLIENT_ID,
+            "client_secret": HH_CLIENT_SECRET,
+        }
+    )
+    new_refresh_token = data.get("refresh_token") or tokens.refresh_token
+    expires_at = _oauth_expires_at(data.get("expires_in"))
+    save_user_hh_tokens(
+        user_id,
+        access_token=data["access_token"],
+        refresh_token=new_refresh_token,
+        expires_at=expires_at,
+    )
+    user_row = get_user_by_id(user_id)
+    at_saved = user_row.hh_access_token if user_row else ""
+    logger.info(
+        "[HH_OAUTH_REFRESH_OK] user_id=%s telegram_id=%s access_token_len_saved=%s access_token_prefix=%s "
+        "expires_at=%s token_event=refresh_grant",
+        user_id,
+        user_row.telegram_id if user_row else None,
+        len(at_saved) if at_saved else 0,
+        (at_saved[:6] if at_saved and len(at_saved) >= 6 else at_saved or ""),
+        expires_at,
+    )
+    return data["access_token"]
+
+
+def _access_token_for_user(user_id: int | None) -> str | None:
+    if user_id is None:
+        return None
+    tokens = get_user_hh_tokens(user_id)
+    if not tokens:
+        raise HHAuthorizationError("HH account is not connected for this user")
+    if tokens.expires_at and datetime.now(timezone.utc) >= tokens.expires_at:
+        logger.info(
+            "[HH_API] access token expired for user_id=%s, refreshing token_event=expires_at_passed",
+            user_id,
+        )
+        return refresh_user_hh_token(user_id)
+    return tokens.access_token
+
+
+def oauth_probe_authenticated_me(user_id: int) -> None:
+    """
+    After OAuth token save: GET /me with same Bearer + HH-User-Agent as api.hh.ru calls.
+    If this returns 200 but /vacancies returns 403, token is valid — restriction is app/endpoint-level.
+    """
+    try:
+        token = _access_token_for_user(user_id)
+    except HHAuthorizationError as e:
+        logger.warning("[HH_OAUTH_ME_PROBE] user_id=%s cannot_resolve_token: %s", user_id, e)
+        return
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    session = _hh_http_session()
+    req = requests.Request("GET", HH_API_ME_URL, headers=headers)
+    prepared = session.prepare_request(req)
+    _hh_drop_duplicate_user_agent(prepared)
+    _log_hh_outgoing_headers(prepared)
+    logger.info(
+        "[HH_OAUTH_ME_PROBE_HEADERS] user_id=%s Accept=%r HH_User_Agent=%r library_User_Agent=%r "
+        "authorization_header_present=%s starts_with_Bearer_=%s",
+        user_id,
+        prepared.headers.get("Accept"),
+        prepared.headers.get("HH-User-Agent"),
+        prepared.headers.get("User-Agent"),
+        bool(prepared.headers.get("Authorization")),
+        str(prepared.headers.get("Authorization", "")).startswith("Bearer "),
+    )
+    try:
+        resp = session.send(prepared, timeout=15)
+    except requests.Timeout as e:
+        logger.warning("[HH_OAUTH_ME_PROBE] user_id=%s GET %s timeout=%s", user_id, HH_API_ME_URL, e)
+        return
+    preview = resp.text[:500]
+    ok = resp.status_code == 200
+    logger.info(
+        "[HH_OAUTH_ME_PROBE] user_id=%s url=%s http_status=%s ok=%s body_preview=%r",
+        user_id,
+        HH_API_ME_URL,
+        resp.status_code,
+        ok,
+        preview,
+    )
+    if ok:
+        logger.info(
+            "[HH_OAUTH_ME_PROBE_CONCLUSION] user_id=%s authenticated_/me_200=true "
+            "— if vacancy search still gets 403 with same token, cause is likely "
+            "HH developer app OpenAPI/API access or endpoint policy, not invalid Bearer encoding.",
+            user_id,
+        )
+    else:
+        logger.warning(
+            "[HH_OAUTH_ME_PROBE_CONCLUSION] user_id=%s authenticated_/me_http_%s "
+            "— token may be rejected globally or app misconfigured before vacancy calls.",
+            user_id,
+            resp.status_code,
+        )
+
+
 def _hh_request_get(
     url: str,
     params: dict | None = None,
     *,
     timeout: float = 20,
+    user_id: int | None = None,
 ) -> requests.Response:
     """
-    Sole entry point for GET requests to api.hh.ru.
-    Uses one shared requests.Session created on first call; headers are set on the Session only.
-    One retry on 403, 5xx, or timeout. Raises HHApiError on failure after retries.
-    Returns response only for HTTP 200.
+    GET helper for api.hh.ru with optional **applicant** user Bearer (e.g. ``/me``).
+
+    Vacancy list ``GET /vacancies`` uses ``_hh_request_get_vacancies`` (application token only).
     """
     params = dict(params) if params else {}
     full_url = _hh_full_url(url, params)
 
     for attempt in range(2):
+        auth_headers = None
         try:
-            response = _hh_send_get(_hh_http_session(), url, params, timeout)
+            token = _access_token_for_user(user_id)
+            if token:
+                auth_headers = {"Authorization": f"Bearer {token}"}
+                _log_access_token_used(user_id, token, attempt, "before_GET_api_hh_ru")
+            scheme_ok = bool(auth_headers and auth_headers.get("Authorization", "").startswith("Bearer "))
+            if auth_headers and not scheme_ok:
+                logger.error("[HH_TOKEN_USE] user_id=%s Authorization_header_missing_Bearer_prefix", user_id)
+        except HHAuthorizationError as e:
+            raise HHApiError(str(e), url=full_url) from e
+        try:
+            response = _hh_send_get(_hh_http_session(), url, params, timeout, headers=auth_headers)
             _log_hh_round_trip_diagnostics(response, full_url, params, attempt + 1)
         except requests.Timeout as e:
             logger.error(
@@ -207,10 +704,51 @@ def _hh_request_get(
             status,
             full_url,
         )
+        _log_hh_response_errors(status, body_preview, user_id, "api_get_non_200")
+
+        if attempt == 0 and user_id is not None and status == 401:
+            try:
+                refresh_user_hh_token(user_id)
+                time.sleep(0.3)
+                continue
+            except HHAuthorizationError as refresh_err:
+                raise HHApiError(str(refresh_err), status_code=status, url=full_url) from refresh_err
+
+        if attempt == 0 and user_id is not None and status == 403:
+            logger.info(
+                "[HH_API] HTTP 403: attempting oauth refresh user_id=%s (HH may still return 403 if issue is app/OpenAPI policy)",
+                user_id,
+            )
+            try:
+                refresh_user_hh_token(user_id)
+                time.sleep(0.3)
+                continue
+            except HHAuthorizationError as rerr:
+                logger.warning("[HH_API] refresh_after_403_failed user_id=%s: %s", user_id, rerr)
 
         if attempt == 0 and (status == 403 or status >= 500):
             time.sleep(_HH_RETRY_DELAY_SEC)
             continue
+
+        if status == 403:
+            reprompt = False
+            if user_id is not None:
+                reprompt = _hh_forbidden_should_prompt_reauth(body_preview)
+            logger.error(
+                "[HH_API_403_FINAL] user_id=%s url=%s prompt_reauthorize=%s "
+                "(non-vacancies GET with applicant Bearer; vacancy list uses application token separately)",
+                user_id,
+                full_url,
+                reprompt,
+            )
+            raise HHVacanciesForbiddenError(
+                f"HH API returned HTTP {status}: {body_preview}",
+                user_id=user_id,
+                status_code=status,
+                url=full_url,
+                response_body_preview=body_preview,
+                prompt_reauthorize=reprompt,
+            )
 
         raise HHApiError(
             f"HH API returned HTTP {status}: {body_preview}",
@@ -222,48 +760,189 @@ def _hh_request_get(
     raise HHApiError("HH API request failed after retries", url=full_url)
 
 
+def _hh_request_get_vacancies(
+    url: str,
+    params: dict | None = None,
+    *,
+    timeout: float = 20,
+    log_user_id: int | None = None,
+    source: str = "vacancies",
+) -> requests.Response:
+    """
+    GET ``/vacancies`` with **application** OAuth Bearer only (never applicant user token).
+    Retries once on timeout, 5xx, or 401 after invalidating the cached app token.
+    """
+    params = dict(params) if params else {}
+    full_url = _hh_full_url(url, params)
+
+    for attempt in range(2):
+        try:
+            app_token = get_hh_app_access_token()
+        except HHAppTokenConfigurationError:
+            raise
+        except HHAuthorizationError as e:
+            raise HHApiError(str(e), url=full_url) from e
+
+        with _HH_APP_TOKEN_LOCK:
+            token_present = bool(_hh_app_access_token)
+            exp_at = (
+                _hh_app_access_token_expires_at.isoformat()
+                if _hh_app_access_token_expires_at
+                else None
+            )
+        logger.info(
+            "[HH_VACANCIES_AUTH] auth_type=application token_present=%s expires_at=%s source=%s log_user_id=%s",
+            token_present,
+            exp_at,
+            source,
+            log_user_id,
+        )
+
+        auth_headers = {
+            "Authorization": f"Bearer {app_token}",
+            "Accept": "application/json",
+        }
+        try:
+            response = _hh_send_get(
+                _hh_http_session(), url, params, timeout, headers=auth_headers
+            )
+            _log_hh_round_trip_diagnostics(response, full_url, params, attempt + 1)
+        except requests.Timeout as e:
+            logger.error(
+                "[HH_VACANCIES] request timeout attempt=%s/2 url=%s error=%s",
+                attempt + 1,
+                full_url,
+                e,
+            )
+            if attempt == 0:
+                time.sleep(_HH_RETRY_DELAY_SEC)
+                continue
+            raise HHApiError(f"HH API request timed out: {e}", url=full_url) from e
+
+        status = response.status_code
+        body_preview = response.text[:_HH_LOG_BODY_MAX]
+
+        if status == 200:
+            logger.info(
+                "[HH_VACANCIES] GET ok status=%s url=%s (details in HH_API_DIAG)",
+                status,
+                full_url,
+            )
+            return response
+
+        logger.error(
+            "[HH_VACANCIES] HH API error status=%s url=%s (details in HH_API_DIAG)",
+            status,
+            full_url,
+        )
+        _log_hh_response_errors(status, body_preview, log_user_id, "vacancies_get_non_200")
+
+        if attempt == 0 and status == 401:
+            logger.warning(
+                "[HH_VACANCIES] HTTP 401 with application token — invalidating app token cache, retrying"
+            )
+            _invalidate_hh_app_access_token_cache()
+            time.sleep(0.3)
+            continue
+
+        if attempt == 0 and (status == 403 or status >= 500):
+            time.sleep(_HH_RETRY_DELAY_SEC)
+            continue
+
+        if status == 403:
+            with _HH_APP_TOKEN_LOCK:
+                tp = bool(_hh_app_access_token)
+                tex = (
+                    _hh_app_access_token_expires_at.isoformat()
+                    if _hh_app_access_token_expires_at
+                    else None
+                )
+            logger.error(
+                "[HH_VACANCIES_403] application_token_used=true token_present=%s "
+                "token_expires_at=%s response_status=%s log_user_id=%s hh_error_body_trunc=%r",
+                tp,
+                tex,
+                status,
+                log_user_id,
+                body_preview,
+            )
+            raise HHVacanciesForbiddenError(
+                f"HH API returned HTTP {status}: {body_preview}",
+                user_id=log_user_id,
+                status_code=status,
+                url=full_url,
+                response_body_preview=body_preview,
+                prompt_reauthorize=False,
+            )
+
+        raise HHApiError(
+            f"HH API returned HTTP {status}: {body_preview}",
+            status_code=status,
+            url=full_url,
+            response_body_preview=body_preview,
+        )
+
+    raise HHApiError("HH vacancies request failed after retries", url=full_url)
+
+
 def hh_api_minimal_probe(*, timeout: float = 20) -> int:
     """
-    Temporary diagnostics: one minimal GET /vacancies using the same Session + HH-User-Agent
-    as production. Uses ``_hh_send_get`` + ``_hh_http_session()`` — the same HTTP primitive
-    inside ``_hh_request_get`` (single attempt so 403/200 both produce a Response to log).
+    Diagnostics: minimal GET /vacancies with the same application auth as production.
 
     Params: text=аналитик, per_page=1, page=0 only.
-
-    After the response, logs ``[HH_API_PROBE]`` with status, body, outgoing headers, effective URL.
 
     Returns:
         0 if HTTP 200, 1 otherwise.
     """
     params = {"text": "аналитик", "per_page": 1, "page": 0}
     full_url = _hh_full_url(HH_API_VACANCIES_URL, params)
-    logger.warning(
-        "[HH_API_PROBE] minimal GET %s (single _hh_send_get; same session as _hh_request_get)",
-        full_url,
-    )
-    response = _hh_send_get(_hh_http_session(), HH_API_VACANCIES_URL, params, timeout)
+    logger.warning("[HH_API_PROBE] minimal GET %s (application Bearer)", full_url)
+    try:
+        response = _hh_request_get_vacancies(
+            HH_API_VACANCIES_URL,
+            params=params,
+            timeout=timeout,
+            source="hh_api_minimal_probe",
+        )
+    except HHVacanciesForbiddenError as exc:
+        logger.warning(
+            "[HH_API_PROBE] forbidden status=%s body_preview=%r",
+            exc.status_code,
+            (exc.response_body_preview or "")[:_HH_LOG_BODY_MAX],
+        )
+        return 1
+    except HHApiError:
+        return 1
     _log_hh_probe_summary("[HH_API_PROBE]", response, full_url, params)
     return 0 if response.status_code == 200 else 1
 
 
 def hh_api_no_text_probe(*, timeout: float = 20) -> int:
     """
-    Temporary diagnostics: GET /vacancies with only per_page=1, page=0 (no ``text`` param).
-
-    Same Session + HH-User-Agent as production via ``_hh_send_get`` / ``_hh_http_session``.
-
-    Logs with tag ``[HH_API_PROBE_NO_TEXT]``.
+    Diagnostics: GET /vacancies with only per_page=1, page=0 (no ``text`` param).
 
     Returns:
         0 if HTTP 200, 1 otherwise.
     """
     params = {"per_page": 1, "page": 0}
     full_url = _hh_full_url(HH_API_VACANCIES_URL, params)
-    logger.warning(
-        "[HH_API_PROBE_NO_TEXT] GET %s (single _hh_send_get; same session as _hh_request_get)",
-        full_url,
-    )
-    response = _hh_send_get(_hh_http_session(), HH_API_VACANCIES_URL, params, timeout)
+    logger.warning("[HH_API_PROBE_NO_TEXT] GET %s (application Bearer)", full_url)
+    try:
+        response = _hh_request_get_vacancies(
+            HH_API_VACANCIES_URL,
+            params=params,
+            timeout=timeout,
+            source="hh_api_no_text_probe",
+        )
+    except HHVacanciesForbiddenError as exc:
+        logger.warning(
+            "[HH_API_PROBE_NO_TEXT] forbidden status=%s body_preview=%r",
+            exc.status_code,
+            (exc.response_body_preview or "")[:_HH_LOG_BODY_MAX],
+        )
+        return 1
+    except HHApiError:
+        return 1
     _log_hh_probe_summary("[HH_API_PROBE_NO_TEXT]", response, full_url, params)
     return 0 if response.status_code == 200 else 1
 
@@ -418,9 +1097,19 @@ def _build_search_text(
     return text, ["name"]
 
 
-def get_vacancies_page(page: int, search_params: dict | None = None, per_page: int = 100):
+def get_vacancies_page(
+    page: int,
+    search_params: dict | None = None,
+    per_page: int = 100,
+    user_id: int | None = None,
+    *,
+    source: str = "get_vacancies_page",
+):
     """
-    GET https://api.hh.ru/vacancies — official HH API (public vacancy search).
+    GET https://api.hh.ru/vacancies — vacancy search (HH OpenAPI).
+
+    Uses **application** OAuth (``client_credentials``) via ``get_hh_app_access_token``.
+    Optional ``user_id`` is **log context only** (not sent as applicant Bearer).
 
     Params match the public API (text, search_field, area, period, salary, etc.).
     See: https://api.hh.ru/openapi/redoc#tag/Poisk-vakansij/operation/get-vacancies
@@ -457,7 +1146,13 @@ def get_vacancies_page(page: int, search_params: dict | None = None, per_page: i
 
     logger.info("[HH_API] get_vacancies_page request URL=%s", _hh_full_url(HH_API_VACANCIES_URL, params))
 
-    response = _hh_request_get(HH_API_VACANCIES_URL, params=params, timeout=20)
+    response = _hh_request_get_vacancies(
+        HH_API_VACANCIES_URL,
+        params=params,
+        timeout=20,
+        log_user_id=user_id,
+        source=source,
+    )
 
     try:
         data = response.json()
@@ -536,15 +1231,36 @@ def _schedule_matches_filter(schedule_name: str, filter_obj) -> bool:
     return True  # accept any schedule
 
 
-def search_vacancies_page(page: int, search_params: dict | None = None, filter_obj=None) -> tuple[int, list]:
+def search_vacancies_page(
+    page: int,
+    search_params: dict | None = None,
+    filter_obj=None,
+    user_id: int | None = None,
+    *,
+    source: str = "search_vacancies_page",
+) -> tuple[int, list]:
     """
     Fetch one page of vacancies from HH API (10 per page for pagination).
+
+    ``user_id`` is optional **Telegram/DB context for logs only** — vacancy GETs use the
+    **application** access token, not the applicant ``hh_access_token``.
 
     Returns:
         (found, vacancies) - found is total from HH API (best effort), vacancies is list of vacancy dicts.
     """
     per_page = 10
-    data = get_vacancies_page(page, search_params, per_page=per_page)
+    if user_id is not None:
+        logger.info(
+            "[HH_VACANCY_SEARCH] context_internal_user_id=%s (GET /vacancies uses application Bearer only)",
+            user_id,
+        )
+    data = get_vacancies_page(
+        page,
+        search_params,
+        per_page=per_page,
+        user_id=user_id,
+        source=source,
+    )
 
     raw_items = data.get("items", [])
     if not isinstance(raw_items, list):
@@ -727,10 +1443,12 @@ def _process_vacancy_items(items: list, filter_obj) -> list:
     return vacancies
 
 
-def search_vacancies(search_params: dict | None = None, filter_obj=None):
+def search_vacancies(search_params: dict | None = None, filter_obj=None, user_id: int | None = None):
     """
     Search vacancies from HH API (legacy: fetches 3 pages, 100 per page).
     Used by monitoring. For interactive search use search_vacancies_page.
+
+    ``user_id`` is accepted for logging context only; GET /vacancies uses **application** OAuth only.
     """
     vacancies = []
     use_custom_filter = filter_obj is not None
@@ -742,7 +1460,13 @@ def search_vacancies(search_params: dict | None = None, filter_obj=None):
 
     for page in range(3):
         logger.info("[HH_API] search_vacancies step=fetch_page page=%s", page)
-        data = get_vacancies_page(page, search_params, per_page=100)
+        data = get_vacancies_page(
+            page,
+            search_params,
+            per_page=100,
+            user_id=user_id,
+            source="monitor.search_vacancies",
+        )
 
         if not isinstance(data, dict):
             logger.warning("[HH_API] search_vacancies page=%s: unexpected data type %s", page, type(data))
