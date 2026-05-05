@@ -17,7 +17,7 @@ from app.hh_api import (
     vacancy_hh_error_user_message,
 )
 from app.hh_auth import respond_to_vacancies_forbidden
-from app.search_flow import reset_search_conversation
+from app.search_flow import begin_filter_edit_flow, reset_search_conversation
 from app.vacancy_results import _store_search_state, fetch_and_show_page, handle_vacancy_page_callback
 from app.user_repository import (
     delete_user_filter,
@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Callback pattern as specified
 CB_FILTER = "saved_filter"
 CB_SEARCH = "saved_filter_search"
+CB_EDIT = "saved_filter_edit"
 CB_DELETE = "saved_filter_delete"
 CB_MONITOR_ON = "saved_filter_mon_on"
 CB_MONITOR_OFF = "saved_filter_mon_off"
@@ -75,11 +76,12 @@ def _build_filter_list_keyboard(filters_list: list) -> InlineKeyboardMarkup:
 def _build_filter_detail_keyboard(filter_id: int, monitoring_enabled: bool) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("Начать поиск", callback_data=f"{CB_SEARCH}:{filter_id}")],
+        [InlineKeyboardButton("Редактировать", callback_data=f"{CB_EDIT}:{filter_id}")],
     ]
     if monitoring_enabled:
-        buttons.append([InlineKeyboardButton("Отключить уведомления о новых вакансиях", callback_data=f"{CB_MONITOR_OFF}:{filter_id}")])
+        buttons.append([InlineKeyboardButton("Отключить уведомления", callback_data=f"{CB_MONITOR_OFF}:{filter_id}")])
     else:
-        buttons.append([InlineKeyboardButton("Включить уведомления о новых вакансиях", callback_data=f"{CB_MONITOR_ON}:{filter_id}")])
+        buttons.append([InlineKeyboardButton("Уведомления", callback_data=f"{CB_MONITOR_ON}:{filter_id}")])
     buttons.append([InlineKeyboardButton("Удалить фильтр", callback_data=f"{CB_DELETE}:{filter_id}")])
     return InlineKeyboardMarkup(buttons)
 
@@ -242,6 +244,35 @@ async def callback_filter_search(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("По вашему запросу вакансии не найдены.")
 
 
+async def callback_filter_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, ensure_user_fn):
+    """User tapped Редактировать - open search wizard in edit mode with prefilled data."""
+    await reset_search_conversation(context.application, update)
+    query = update.callback_query
+    await query.answer()
+
+    user, err = ensure_user_fn(update)
+    if err:
+        await query.edit_message_text(err)
+        return
+
+    parts = query.data.split(":", 1)
+    if len(parts) != 2:
+        await query.edit_message_text("Ошибка.")
+        return
+    try:
+        filter_id = int(parts[1])
+    except ValueError:
+        await query.edit_message_text("Ошибка.")
+        return
+
+    f = get_user_filter_by_id(filter_id, user.id)
+    if not f:
+        await query.edit_message_text("Фильтр не найден.")
+        return
+
+    await begin_filter_edit_flow(update, context, user, f)
+
+
 async def callback_filter_monitor_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, ensure_user_fn, enable: bool):
     """User tapped Включить/Отключить мониторинг."""
     await reset_search_conversation(context.application, update)
@@ -344,6 +375,9 @@ def build_filters_handlers(ensure_user_fn):
     async def wrap_search(u, c):
         return await callback_filter_search(u, c, ensure_user_fn)
 
+    async def wrap_edit(u, c):
+        return await callback_filter_edit(u, c, ensure_user_fn)
+
     async def wrap_delete(u, c):
         return await callback_filter_delete(u, c, ensure_user_fn)
 
@@ -380,6 +414,7 @@ def build_filters_handlers(ensure_user_fn):
         MessageHandler(filters.Regex("^💾 Мои фильтры$"), wrap_filters),
         CallbackQueryHandler(wrap_select, pattern=rf"^{CB_FILTER}:"),
         CallbackQueryHandler(wrap_search, pattern=rf"^{CB_SEARCH}:"),
+        CallbackQueryHandler(wrap_edit, pattern=rf"^{CB_EDIT}:"),
         CallbackQueryHandler(wrap_mon_on, pattern=rf"^{CB_MONITOR_ON}:"),
         CallbackQueryHandler(wrap_mon_off, pattern=rf"^{CB_MONITOR_OFF}:"),
         CallbackQueryHandler(wrap_delete, pattern=rf"^{CB_DELETE}:"),

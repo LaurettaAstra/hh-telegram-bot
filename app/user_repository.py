@@ -271,6 +271,50 @@ def update_filter_monitoring(filter_id: int, user_id: int, enabled: bool) -> boo
         session.close()
 
 
+def update_user_filter(
+    filter_id: int,
+    user_id: int,
+    *,
+    title_keywords: str | None = None,
+    title_exclude_keywords: str | None = None,
+    description_keywords: str | None = None,
+    description_exclude_keywords: str | None = None,
+    city: str | None = None,
+    work_format: str | None = None,
+    salary_from: int | None = None,
+) -> SavedFilter | None:
+    """
+    Update existing saved filter fields without touching monitoring flags.
+    Returns updated filter or None if filter missing/not owned.
+    """
+    session = SessionLocal()
+    try:
+        result = session.execute(
+            select(SavedFilter).where(
+                SavedFilter.id == filter_id,
+                SavedFilter.user_id == user_id,
+            )
+        )
+        f = result.scalars().first()
+        if not f:
+            return None
+        f.title_keywords = title_keywords
+        f.title_exclude_keywords = title_exclude_keywords
+        f.description_keywords = description_keywords
+        f.description_exclude_keywords = description_exclude_keywords
+        f.city = city
+        f.work_format = work_format
+        f.salary_from = salary_from
+        session.commit()
+        session.refresh(f)
+        return f
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
 def update_filter_last_monitoring(filter_id: int, last_at: datetime) -> None:
     """Update last_monitoring_at for a filter (used by monitoring job)."""
     session = SessionLocal()
