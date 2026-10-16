@@ -97,21 +97,36 @@ class ResumeUpdatesTest(unittest.TestCase):
 class ResumeApiTest(unittest.TestCase):
     @patch.object(resume_api, "refresh_user_hh_token")
     @patch.object(resume_api, "_access_token_for_user", return_value="applicant-token")
-    @patch.object(resume_api.requests, "request")
+    @patch.object(resume_api.requests.Session, "send")
     def test_publish_refreshes_401_and_accepts_204(self, request, token, refresh):
         request.side_effect = [Mock(status_code=401), Mock(status_code=204)]
         resume_api.publish_resume(1, "abc")
         refresh.assert_called_once_with(1)
         self.assertEqual(request.call_count, 2)
-        self.assertEqual(request.call_args.args, ("POST", "https://api.hh.ru/resumes/abc/publish"))
-        self.assertEqual(request.call_args.kwargs["headers"]["Authorization"], "Bearer applicant-token")
+        prepared = request.call_args.args[0]
+        self.assertEqual(prepared.method, "POST")
+        self.assertEqual(prepared.url, "https://api.hh.ru/resumes/abc/publish")
+        self.assertEqual(prepared.headers["Authorization"], "Bearer applicant-token")
 
     @patch.object(resume_api, "_access_token_for_user", return_value="applicant-token")
-    @patch.object(resume_api.requests, "request", side_effect=resume_api.requests.Timeout)
+    @patch.object(resume_api.requests.Session, "send", side_effect=resume_api.requests.Timeout)
     def test_post_timeout_is_not_retried(self, request, token):
         with self.assertRaises(HHApiError):
             resume_api.publish_resume(1, "abc")
         request.assert_called_once()
+
+    @patch.object(resume_api, "HH_API_HH_USER_AGENT", "ResumeBot/1.0 (test@example.com)")
+    @patch.object(resume_api, "_access_token_for_user", return_value="applicant-token")
+    @patch.object(resume_api.requests.Session, "send")
+    def test_hh_header_and_error_codes(self, request, token):
+        response = Mock(status_code=403)
+        response.json.return_value = {"errors": [{"type": "forbidden", "value": "application"}]}
+        request.return_value = response
+        with self.assertRaisesRegex(HHApiError, "HTTP 403.*forbidden.*application"):
+            resume_api.list_my_resumes(1)
+        headers = request.call_args.args[0].headers
+        self.assertNotIn("User-Agent", headers)
+        self.assertEqual(headers["HH-User-Agent"], "ResumeBot/1.0 (test@example.com)")
 
     def test_menu_contains_both_buttons(self):
         import main

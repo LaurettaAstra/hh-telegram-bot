@@ -131,8 +131,11 @@ def build_resume_handlers(ensure_user):
             return
         try:
             resumes = await asyncio.to_thread(list_my_resumes, user.id)
-        except (HHApiError, HHAuthorizationError):
-            await update.effective_message.reply_text("Не удалось получить резюме. Проверьте подключение HH через /connect_hh.")
+        except HHAuthorizationError:
+            await update.effective_message.reply_text("Истёк доступ к аккаунту HH. Подключите его через /connect_hh.")
+            return
+        except HHApiError as exc:
+            await update.effective_message.reply_text(f"Не удалось получить резюме. {exc}")
             return
         resumes = [r for r in resumes if r.get("status", {}).get("id") == "published" and not r.get("blocked")]
         if not resumes:
