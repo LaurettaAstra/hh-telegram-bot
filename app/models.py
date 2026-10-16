@@ -37,6 +37,17 @@ class User(Base):
     search_sessions = relationship("SearchSession", back_populates="user")
 
 
+class ResumeAutoUpdate(Base):
+    __tablename__ = "resume_auto_updates"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    resume_id = Column(Text, nullable=False)
+    enabled = Column(Boolean, default=False, nullable=False)
+    next_run_at = Column(DateTime(timezone=True), nullable=False)
+    last_success_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
+
+
 class SavedFilter(Base):
     __tablename__ = "saved_filters"
 

@@ -87,11 +87,11 @@ async def send_hh_authorization_prompt(
         return
 
     text = (
-        "Optional: connect your personal HH.ru applicant account for future bot features. "
-        "Vacancy search already works without this — use /search or saved filters."
+        "Для автообновления резюме подключите личный аккаунт соискателя HH.ru. "
+        "После авторизации нажмите «Включить автообновление резюме» ещё раз."
     )
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("HH applicant (optional)", url=auth_url)]]
+        [[InlineKeyboardButton("Подключить HH.ru", url=auth_url)]]
     )
 
     if answer_callback and update.callback_query:

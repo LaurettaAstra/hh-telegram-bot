@@ -30,6 +30,10 @@ from app.repository import mark_vacancy_sent
 from app.search_flow import build_search_conversation_handler, reset_search_conversation
 from app.filters_handlers import build_filters_handlers
 from app.user_repository import get_or_create_user, USER_FRIENDLY_ERROR
+from app.resume_updates import (
+    ENABLE_TEXT, DISABLE_TEXT, build_resume_handlers, init_resume_updates,
+    resume_update_job, resume_update_loop,
+)
 
 load_dotenv()
 
@@ -48,6 +52,8 @@ if not BOT_TOKEN:
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
+        [KeyboardButton(ENABLE_TEXT)],
+        [KeyboardButton(DISABLE_TEXT)],
         [KeyboardButton("🔍 Поиск вакансий"), KeyboardButton("💾 Мои фильтры")],
         [KeyboardButton("ℹ️ О боте")],
     ],
@@ -81,6 +87,8 @@ async def _refresh_bot_commands(bot):
     await bot.delete_my_commands()
     await bot.set_my_commands(
         [
+            BotCommand("resume_on", "Включить автообновление резюме"),
+            BotCommand("resume_off", "Отключить автообновление резюме"),
             BotCommand("search", "🔍 Поиск вакансий"),
             BotCommand("filters", "💾 Мои фильтры"),
             BotCommand("info", "ℹ️ О боте"),
@@ -136,7 +144,8 @@ async def connect_hh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Поиск вакансий на HH.ru в боте идёт от имени приложения (OAuth client_credentials на сервере). "
         "Личный вход соискателя для поиска не нужен.\n\n"
-        "Ссылка ниже — опционально, на будущее, если появятся функции, привязанные к вашему аккаунту HH.\n\n"
+        "Для автообновления резюме подключите личный аккаунт HH по ссылке ниже. "
+        "После подключения нажмите «Включить автообновление резюме» и выберите резюме.\n\n"
         f"{auth_url}"
     )
 
@@ -211,6 +220,14 @@ async def monitoring_job_callback(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(application: Application):
+    await asyncio.to_thread(init_resume_updates)
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            resume_update_job, interval=60, first=1, name="hh_resume_updates",
+            job_kwargs={"max_instances": 1, "coalesce": True},
+        )
+    else:
+        application.create_task(resume_update_loop(application.bot))
     await _refresh_bot_commands(application.bot)
     if HH_REDIRECT_URI:
         parsed = urlparse(HH_REDIRECT_URI)
@@ -323,6 +340,9 @@ def build_application() -> Application:
         logger.warning(
             "Job queue not available; monitoring uses asyncio fallback in post_init"
         )
+
+    for handler in build_resume_handlers(_ensure_user):
+        app.add_handler(handler, group=-1)
 
     for handler in build_filters_handlers(_ensure_user):
         app.add_handler(handler, group=-1)
